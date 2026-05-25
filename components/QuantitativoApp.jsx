@@ -103,12 +103,25 @@ const toB64 = (f) => new Promise((res,rej)=>{const r=new FileReader();r.onload=(
 // ─── APP ──────────────────────────────────────────────────────────────────────
 export default function QuantitativoApp() {
   const [secao,setSecao]         = useState("obras");
-  const [clientes,setClientes]   = useState(()=>{try{return JSON.parse(localStorage.getItem("qt_clientes")||"[]");}catch{return [];}});
-  const [obras,setObras]         = useState(()=>{try{return JSON.parse(localStorage.getItem("qt_obras")||"[]");}catch{return [];}});
+  const [clientes,setClientes] = useState([]);
+  const [obras,setObras]       = useState([]);
   const [sinapiRef,setSinapiRef] = useState(null);
+  const iniciado = useRef(false);
 
-  useEffect(()=>{localStorage.setItem("qt_clientes",JSON.stringify(clientes));},[clientes]);
-  useEffect(()=>{localStorage.setItem("qt_obras",JSON.stringify(obras));},[obras]);
+  // Carrega do localStorage só no cliente (fix SSR)
+  useEffect(()=>{
+    try {
+      const c = localStorage.getItem("qt_clientes");
+      const o = localStorage.getItem("qt_obras");
+      if(c) setClientes(JSON.parse(c));
+      if(o) setObras(JSON.parse(o));
+    } catch(e){}
+    iniciado.current = true;
+  },[]);
+
+  // Só salva depois de ter carregado (evita sobrescrever com [])
+  useEffect(()=>{ if(iniciado.current) localStorage.setItem("qt_clientes",JSON.stringify(clientes)); },[clientes]);
+  useEffect(()=>{ if(iniciado.current) localStorage.setItem("qt_obras",JSON.stringify(obras)); },[obras]);
   useEffect(()=>{fetch("/api/sinapi?q=").then(r=>r.json()).then(d=>{if(d.referencia)setSinapiRef(d.referencia);}).catch(()=>{});},[]);
 
   const totalPlanta = obras.reduce((s,o)=>s+(o.plantas?.length||0),0);
