@@ -1,5 +1,16 @@
 "use client";
 import { useState, useRef, useCallback, useEffect } from "react";
+import { SINAPI_BA } from "../lib/sinapi";
+
+// ─── LOOKUP SINAPI (client-side, sem API) ────────────────────────────────────
+const SINAPI_MAP = Object.fromEntries(
+  SINAPI_BA.map(i => [String(i.codigo).replace(/\/\d+$/, ""), i])
+);
+function getSinapiPreco(codigo) {
+  if (!codigo) return null;
+  const key = String(codigo).replace(/\/\d+$/, "");
+  return SINAPI_MAP[key]?.preco || null;
+}
 
 // ─── DETECÇÃO DE DISCIPLINA ───────────────────────────────────────────────────
 const PREFIXOS = {
@@ -389,14 +400,13 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           todosItens.push(...(parsed.itens||[]));
           ultimoParsed=parsed;
         }
-        // Buscar preços SINAPI
-        setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Buscando preços SINAPI..."}:x));
-        const codigos=[...new Set(todosItens.map(i=>i.sinapi_sugerido).filter(Boolean))];
-        const precos={};
-        await Promise.all(codigos.map(async cod=>{
-          try{const r=await fetch(`/api/sinapi?codigo=${cod}`);const d=await r.json();if(d.itens?.[0])precos[cod]=d.itens[0].preco;}catch{}
+        // Buscar preços SINAPI — lookup direto na base local
+        const itensEnriquecidos=todosItens.map(it=>({
+          ...it,
+          preco_sinapi: getSinapiPreco(it.sinapi_sugerido)
         }));
-        const itensEnriquecidos=todosItens.map(it=>({...it,preco_sinapi:precos[it.sinapi_sugerido]||null}));
+        const nPrecos = itensEnriquecidos.filter(i=>i.preco_sinapi).length;
+        console.log(`SINAPI: ${nPrecos}/${itensEnriquecidos.length} itens com preço`);
         const novaPlanta={
           id:uid(),fileName:pend.fileName,
           disciplina:ultimoParsed?.disciplina||pend.disciplina,
