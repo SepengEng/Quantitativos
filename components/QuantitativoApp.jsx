@@ -125,7 +125,7 @@ export default function QuantitativoApp() {
   useEffect(()=>{fetch("/api/sinapi?q=").then(r=>r.json()).then(d=>{if(d.referencia)setSinapiRef(d.referencia);}).catch(()=>{});},[]);
 
   const totalPlanta = obras.reduce((s,o)=>s+(o.plantas?.length||0),0);
-  const totalItens  = obras.reduce((s,o)=>s+(o.plantas||[]).reduce((ss,p)=>ss+(p.itens?.length||0),ss),0);
+  const totalItens  = obras.reduce((s,o)=>s+(o.plantas||[]).reduce((ss,p)=>ss+(p.itens?.length||0),0),0);
 
   return (
     <div style={{display:"flex",minHeight:"100vh",fontFamily:"system-ui,sans-serif",background:"#f9fafb"}}>
