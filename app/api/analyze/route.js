@@ -43,7 +43,10 @@ export async function POST(request) {
     return Response.json({ type: "error", error: { type: "gemini_error", message: data.error.message } });
   }
 
-  // Converte resposta Gemini → formato Anthropic (componente espera esse formato)
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+  // Gemini 2.5 Flash tem "thinking parts" — pega só o texto real (sem thought:true)
+  const parts = data.candidates?.[0]?.content?.parts || [];
+  const textPart = parts.find(p => p.text && !p.thought) || parts.find(p => p.text);
+  const text = textPart?.text || "{}";
+
   return Response.json({ content: [{ type: "text", text }] });
 }
