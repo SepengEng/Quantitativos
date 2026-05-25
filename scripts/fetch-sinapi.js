@@ -38,18 +38,32 @@ function getMeses() {
 // Padrões de URL da Caixa para SINAPI Bahia
 function getURLs(mm, yyyy) {
   return [
-    // Composições Sintético BA (arquivo principal)
     `https://www.caixa.gov.br/Downloads/sinapi-custo-ref-composicoes-sintetico-ba/SINAPI_ref_insu_comp_BA_${mm}${yyyy}_NaoDesonerado.zip`,
     `https://www.caixa.gov.br/Downloads/sinapi-custo-ref-insumos-sintetico-ba/SINAPI_ref_insu_BA_${mm}${yyyy}_NaoDesonerado.zip`,
+    // Padrão alternativo (nome sem "insu")
+    `https://www.caixa.gov.br/Downloads/sinapi-custo-ref-composicoes-sintetico-ba/SINAPI_ref_comp_BA_${mm}${yyyy}_NaoDesonerado.zip`,
   ];
 }
 
-function downloadFile(url) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function downloadFile(url, tentativa = 1) {
   return new Promise((resolve, reject) => {
+    const opts = {
+      timeout: 90000,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "*/*",
+      },
+    };
     const chunks = [];
-    const req = https.get(url, { timeout: 30000 }, (res) => {
+    const req = https.get(url, opts, (res) => {
       if (res.statusCode === 302 || res.statusCode === 301) {
-        return downloadFile(res.headers.location).then(resolve).catch(reject);
+        return downloadFile(res.headers.location, tentativa).then(resolve).catch(reject);
+      }
+      if (res.statusCode === 429) {
+        req.destroy();
+        return reject(new Error("HTTP 429"));
       }
       if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
       res.on("data", (c) => chunks.push(c));
@@ -131,6 +145,8 @@ async function main() {
         if (itens.length > 100) { mesRef = label; break; }
       } catch (e) {
         console.log(`❌ ${e.message}`);
+        // Delay entre tentativas para evitar rate limit
+        await sleep(3000);
       }
     }
     if (itens.length > 100) break;
