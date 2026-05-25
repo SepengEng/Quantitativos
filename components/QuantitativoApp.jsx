@@ -67,11 +67,22 @@ function detectarDisciplina(fileName) {
 
 // ─── PROMPTS POR DISCIPLINA ───────────────────────────────────────────────────
 const BASE = `
-REGRAS: Meça pelas cotas visíveis e conte símbolos. NÃO copie tabelas do documento.
-Sugira código SINAPI Bahia Não Desonerado para cada item.
-Fonte: "📐 Cota" | "🔢 Contagem" | "🧮 Cálculo" | "🔍 Inferência"
-Retorne APENAS JSON:
-{"disciplina":"...","escala":"1:XX","resumo":"...","itens":[{"codigo_item":"XXX-001","descricao":"...","un":"m|m²|m³|un|kg","qtd":0.00,"fonte":"📐 Cota","obs":"como medido","sinapi_sugerido":"XXXXX","sinapi_descricao":"..."}],"alertas":["..."]}`;
+INSTRUÇÕES DE ORÇAMENTISTA PROFISSIONAL:
+1. Leia o cabeçalho/título do desenho para entender o que está representado e a escala (ex: 1:50, 1:100, 1:200)
+2. Use TODAS as informações disponíveis: cotas explícitas, tabelas de armação, quadros de esquadrias, legendas, notas técnicas, hachuras e símbolos
+3. Para tabelas de armação/materiais no desenho: extraia diretamente os dados (diâmetro, comprimento, quantidade de barras)
+4. Quando não houver cota explícita: estime pela escala do desenho, prática construtiva típica ou contexto — e marque como Inferência
+5. NUNCA retorne lista vazia se houver qualquer elemento quantificável visível — extraia o máximo possível
+6. Para cada item, sugira o código SINAPI Bahia Não Desonerado mais preciso
+
+Fonte de medição a usar em cada item:
+"📐 Cota" = dimensão lida de cota explícita no desenho
+"🔢 Contagem" = elementos contados símbolo a símbolo
+"🧮 Cálculo" = calculado a partir de cotas (área = L×C, volume = área×esp, etc.)
+"🔍 Inferência" = estimado por escala, tabela de armação ou prática construtiva
+
+Retorne APENAS JSON válido sem texto antes ou depois:
+{"disciplina":"...","escala":"1:XX","resumo":"descrição do que o desenho representa e principais dimensões encontradas","itens":[{"codigo_item":"XXX-001","descricao":"descrição técnica completa do serviço","un":"m|m²|m³|un|kg","qtd":0.00,"fonte":"📐 Cota","obs":"como foi medido especificamente","sinapi_sugerido":"XXXXX","sinapi_descricao":"descrição curta SINAPI"}],"alertas":["itens a confirmar em campo"]}`;
 
 const PROMPTS = {
 "Arquitetura":`Especialista em arquitetura predial. Extraia: PAREDES (m e m² por segmento — alvenaria e drywall separados), PISOS (m² por ambiente e tipo), ESQUADRIAS (tipo, dimensões, contagem), REVESTIMENTOS (m² por tipo), COBERTURA (m² e tipo), LOUÇAS (símbolo a símbolo), SPLITS (BTU anotados).
@@ -436,8 +447,23 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             })
           });
           const data=await resp.json();
+          // Detectar erros da API do Claude (chave, modelo, rate limit, etc.)
+          if(data.error){
+            throw new Error(`Claude API: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
+          }
+          if(!data.content){
+            throw new Error(`Resposta inesperada da API: ${JSON.stringify(data).slice(0,200)}`);
+          }
           const text=data.content?.find(b=>b.type==="text")?.text||"{}";
-          const parsed=JSON.parse(text.replace(/```json|```/g,"").trim());
+          console.log(`[IA pág.${i+1}] resposta bruta:`, text.slice(0,300));
+          let parsed={itens:[]};
+          try{
+            const clean=text.replace(/```json[\s\S]*?```|```[\s\S]*?```/g, m=>m.replace(/```json|```/g,"")).replace(/```json|```/g,"").trim();
+            const jsonMatch=clean.match(/\{[\s\S]*\}/);
+            if(jsonMatch) parsed=JSON.parse(jsonMatch[0]);
+          }catch(parseErr){
+            console.warn("Falha ao parsear JSON da IA:", parseErr.message, "Texto:", text.slice(0,500));
+          }
           todosItens.push(...(parsed.itens||[]));
           ultimoParsed=parsed;
         }
