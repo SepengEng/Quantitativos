@@ -29,7 +29,15 @@ export async function GET(request) {
     itens = SINAPI_BA.map(i => ({ codigo: normCod(i.codigo), descricao: i.descricao, un: i.un, preco: i.preco }));
   }
 
-  if (codigo) {
+  // Busca em batch por múltiplos códigos (ex: ?codigos=87451,87452,96527)
+  const codigos = (searchParams.get("codigos") || "").split(",").map(normCod).filter(Boolean);
+
+  if (codigos.length > 0) {
+    const set = new Set(codigos);
+    const mapa = {};
+    itens.forEach(i => { if (set.has(normCod(i.codigo))) mapa[normCod(i.codigo)] = i; });
+    return Response.json({ ...meta, mapa });
+  } else if (codigo) {
     // Busca exata por código (normalizado)
     itens = itens.filter(i => normCod(i.codigo) === codigo);
   } else if (q) {

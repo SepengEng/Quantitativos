@@ -2,14 +2,36 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { SINAPI_BA } from "../lib/sinapi";
 
-// ─── LOOKUP SINAPI (client-side, sem API) ────────────────────────────────────
+// ─── LOOKUP SINAPI (fallback local ~150 itens, usado só se API falhar) ───────
 const SINAPI_MAP = Object.fromEntries(
   SINAPI_BA.map(i => [String(i.codigo).replace(/\/\d+$/, ""), i])
 );
-function getSinapiPreco(codigo) {
+function getSinapiPrecoLocal(codigo) {
   if (!codigo) return null;
   const key = String(codigo).replace(/\/\d+$/, "");
   return SINAPI_MAP[key]?.preco || null;
+}
+
+// Resolve preços em batch via API (banco completo 12.638 itens SINAPI BA)
+async function resolverPrecosBatch(itens) {
+  const codigos = [...new Set(itens.map(i => i.sinapi_sugerido).filter(Boolean))];
+  if (!codigos.length) return {};
+  try {
+    const r = await fetch(`/api/sinapi?codigos=${encodeURIComponent(codigos.join(","))}`);
+    const d = await r.json();
+    if (d.mapa) {
+      const mapa = {};
+      Object.entries(d.mapa).forEach(([cod, item]) => { mapa[cod] = item.preco; });
+      return mapa;
+    }
+  } catch {}
+  // fallback: usar base local
+  const mapa = {};
+  codigos.forEach(cod => {
+    const p = getSinapiPrecoLocal(cod);
+    if (p) mapa[cod] = p;
+  });
+  return mapa;
 }
 
 // ─── DETECÇÃO DE DISCIPLINA ───────────────────────────────────────────────────
@@ -406,7 +428,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         for(let i=0;i<pend.imgs.length;i++){
           setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`}:x));
           const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:4096,system:prompt,
+            body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:4096,system:prompt,
               messages:[{role:"user",content:[
                 {type:"image",source:{type:"base64",media_type:pend.imgs[i].type,data:pend.imgs[i].base64}},
                 {type:"text",text:`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}` }
@@ -419,10 +441,12 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           todosItens.push(...(parsed.itens||[]));
           ultimoParsed=parsed;
         }
-        // Buscar preços SINAPI — lookup direto na base local
+        // Buscar preços SINAPI — API completa (12.638 itens SINAPI BA)
+        setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Buscando preços SINAPI..."}:x));
+        const precoMap = await resolverPrecosBatch(todosItens);
         const itensEnriquecidos=todosItens.map(it=>({
           ...it,
-          preco_sinapi: getSinapiPreco(it.sinapi_sugerido)
+          preco_sinapi: precoMap[it.sinapi_sugerido] || null
         }));
         const nPrecos = itensEnriquecidos.filter(i=>i.preco_sinapi).length;
         console.log(`SINAPI: ${nPrecos}/${itensEnriquecidos.length} itens com preço`);
