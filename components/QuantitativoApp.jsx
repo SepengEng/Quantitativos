@@ -20,9 +20,23 @@ const PREFIXOS = {
   "CFT":"CFTV","CAM":"CFTV","VOZ":"Dados e Voz","DAD":"Dados e Voz",
   "SPD":"SPDA","GAS":"Gás Industrial","TUB":"Gás Industrial","MEC":"Mecânica",
 };
+// Padrões BYD — busca em qualquer posição do nome (ex: DW-..._AC2-, DW-..._WS6-)
+const PREFIXOS_INLINE = {
+  "_AC":"Arquitetura",    "_WS":"Hidrossanitária",
+  "_ST":"Estrutura",      "_PS":"Elétrica",
+  "_HS":"HVAC",           "_FP":"Incêndio",
+  "_MS":"Especificação",  "_BD":"Elétrica",
+  "-AC":"Arquitetura",    "-WS":"Hidrossanitária",
+  "-ST":"Estrutura",      "-PS":"Elétrica",
+};
 function detectarDisciplina(fileName) {
   if (!fileName) return null;
   const u = fileName.toUpperCase();
+  // Checar padrões inline (BYD e outros com código interno no nome)
+  for (const [p,d] of Object.entries(PREFIXOS_INLINE)) {
+    if (u.includes(p)) return d;
+  }
+  // Checar prefixos padrão (início do nome ou entre separadores)
   for (const [p,d] of Object.entries(PREFIXOS)) {
     if (u.startsWith(p)||u.includes(`-${p}-`)||u.includes(`_${p}_`)||u.includes(`-${p}_`)||u.includes(`_${p}-`)) return d;
   }
@@ -67,6 +81,11 @@ SINAPIs: Cabo Cat6:91970|Cat6A:91973|Fibra:91972|Eletroduto 25mm:91911|Bandeja 1
 ${BASE}`,
 "SPDA":`Especialista em SPDA (NBR 5419). Extraia: CAPTORES (tipo e qtd: Franklin/gaiola/ESE), CABOS DESCENDENTES (m), ANEL ATERRAMENTO (m), HASTES (contar), CAIXAS INSPEÇÃO SPDA (contar), DPS (contar por classe I/II/III), CABO MALHA (m cobertura).
 SINAPIs: Haste aterramento:91960|Cabo cobre nu 35mm²:91967|50mm²:91961|70mm²:91968|Cx inspeção SPDA:91962|Captor Franklin:91963|DPS classe II:91965
+${BASE}`,
+"Especificação":`Especialista em especificações técnicas de materiais e equipamentos industriais. 
+Analise o documento e extraia: EQUIPAMENTOS (nome, tag, capacidade/volume, potência), TUBULAÇÕES (material, diâmetro, comprimento estimado), TANQUES/VASOS (volume m³, material, dimensões), BOMBAS (tipo, vazão m³/h, potência kW), INSTRUMENTAÇÃO (manômetros, transmissores, válvulas - contar por símbolo). 
+Para itens de processo sem SINAPI, use código da família mais próxima ou deixe sinapi_sugerido vazio.
+SINAPIs: Tubo aço carbono 1":74156|2":74157|4":74159|6":74160|Válvula esfera:74163|Suporte:74165|Bomba centrífuga fornec.:98300
 ${BASE}`,
 "Gás Industrial":`Especialista em gás industrial/processo (NBR 15526). Extraia: TUBULAÇÕES (m por ø e material: aço carbono/cobre/PEAD), VÁLVULAS (contar por tipo e ø), SUPORTES (a cada 1,5m para ø≤2"), INSTRUMENTAÇÃO (contar manômetros/transmissores), EQUIPAMENTOS (reguladores/filtros — contar), ISOLAMENTO (m com isolamento).
 SINAPIs: Aço carbono 1":74156|2":74157|3":74158|4":74159|6":74160|Cobre 15mm:74161|28mm:74162|Válvula esfera inox 1":74163|2":74164|Suporte sela:74165|Isolamento:74166|Regulador pressão:74203
