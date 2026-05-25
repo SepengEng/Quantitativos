@@ -12,26 +12,41 @@ function getSinapiPrecoLocal(codigo) {
   return SINAPI_MAP[key]?.preco || null;
 }
 
-// Resolve preços em batch via API (banco completo 12.638 itens SINAPI BA)
+// Resolve preços: 1º por código, 2º por descrição (banco completo 12.638 itens)
 async function resolverPrecosBatch(itens) {
+  const resultado = {};
+  const semPreco  = [];
+
+  // 1ª passagem: batch por código
   const codigos = [...new Set(itens.map(i => i.sinapi_sugerido).filter(Boolean))];
-  if (!codigos.length) return {};
-  try {
-    const r = await fetch(`/api/sinapi?codigos=${encodeURIComponent(codigos.join(","))}`);
-    const d = await r.json();
-    if (d.mapa) {
-      const mapa = {};
-      Object.entries(d.mapa).forEach(([cod, item]) => { mapa[cod] = item.preco; });
-      return mapa;
-    }
-  } catch {}
-  // fallback: usar base local
-  const mapa = {};
-  codigos.forEach(cod => {
-    const p = getSinapiPrecoLocal(cod);
-    if (p) mapa[cod] = p;
+  if (codigos.length) {
+    try {
+      const r = await fetch(`/api/sinapi?codigos=${encodeURIComponent(codigos.join(","))}`);
+      const d = await r.json();
+      if (d.mapa) Object.entries(d.mapa).forEach(([cod, item]) => { resultado[cod] = item.preco; });
+    } catch {}
+  }
+
+  // 2ª passagem: itens sem preço → busca por descrição
+  itens.forEach(it => {
+    if (!resultado[it.sinapi_sugerido]) semPreco.push(it);
   });
-  return mapa;
+
+  await Promise.all(semPreco.map(async it => {
+    const desc = it.sinapi_descricao || it.descricao || "";
+    if (!desc) return;
+    try {
+      const r = await fetch(`/api/sinapi?match=${encodeURIComponent(desc)}`);
+      const d = await r.json();
+      if (d.item?.preco) {
+        resultado[it.sinapi_sugerido || desc] = d.item.preco;
+        // atualiza o código para o real encontrado
+        it._sinapi_real = { codigo: d.item.codigo, descricao: d.item.descricao, preco: d.item.preco };
+      }
+    } catch {}
+  }));
+
+  return resultado;
 }
 
 // ─── DETECÇÃO DE DISCIPLINA ───────────────────────────────────────────────────
@@ -472,7 +487,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const precoMap = await resolverPrecosBatch(todosItens);
         const itensEnriquecidos=todosItens.map(it=>({
           ...it,
-          preco_sinapi: precoMap[it.sinapi_sugerido] || null
+          // Se encontrou match por descrição, usa os dados reais
+          sinapi_sugerido: it._sinapi_real?.codigo || it.sinapi_sugerido,
+          sinapi_descricao: it._sinapi_real?.descricao || it.sinapi_descricao,
+          preco_sinapi: it._sinapi_real?.preco || precoMap[it.sinapi_sugerido] || null
         }));
         const nPrecos = itensEnriquecidos.filter(i=>i.preco_sinapi).length;
         console.log(`SINAPI: ${nPrecos}/${itensEnriquecidos.length} itens com preço`);
