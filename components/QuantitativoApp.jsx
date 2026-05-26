@@ -490,7 +490,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           if(i>0) await new Promise(r=>setTimeout(r,4000));
           const pgMsg=isPDF?`IA lendo PDF completo${pend.disciplina?` · ${pend.disciplina}`:""}...`:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
           setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
-          const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?8192:4096,system:prompt,
+          const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?65536:32768,system:prompt,
             messages:[{role:"user",content:[
               {type:"image",source:{type:"base64",media_type:pend.imgs[i].type,data:pend.imgs[i].base64}},
               {type:"text",text:isPDF
@@ -519,15 +519,40 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             throw new Error(`Resposta inesperada da API: ${JSON.stringify(data).slice(0,200)}`);
           }
           const text=data.content?.find(b=>b.type==="text")?.text||"{}";
-          console.log(`[IA pág.${i+1}] resposta bruta:`, text.slice(0,300));
+          const finishReason=data.finishReason||"";
+          console.log(`[IA pág.${i+1}] finishReason=${finishReason} len=${text.length} início:`, text.slice(0,300));
           let parsed={itens:[]};
           try{
+            // Remove markdown fences mantendo o conteúdo
             const clean=text.replace(/```json[\s\S]*?```|```[\s\S]*?```/g, m=>m.replace(/```json|```/g,"")).replace(/```json|```/g,"").trim();
+            // Tenta extrair o maior bloco JSON válido
             const jsonMatch=clean.match(/\{[\s\S]*\}/);
-            if(jsonMatch) parsed=JSON.parse(jsonMatch[0]);
+            if(jsonMatch){
+              try{
+                parsed=JSON.parse(jsonMatch[0]);
+              }catch{
+                // JSON truncado (MAX_TOKENS) — tenta recuperar itens já completos
+                const itensMatch=jsonMatch[0].match(/"itens"\s*:\s*\[([\s\S]*)/);
+                if(itensMatch){
+                  const itensStr=itensMatch[1];
+                  // Encontra objetos completos de item
+                  const itemRegex=/\{[^{}]*(?:"[^"]*"[^{}]*)*\}/g;
+                  const partialItens=[];
+                  let m;
+                  while((m=itemRegex.exec(itensStr))!==null){
+                    try{ partialItens.push(JSON.parse(m[0])); }catch{}
+                  }
+                  if(partialItens.length>0){
+                    parsed={itens:partialItens,resumo:"(resposta truncada — itens parciais recuperados)"};
+                    console.warn(`JSON truncado, recuperados ${partialItens.length} itens parciais`);
+                  }
+                }
+              }
+            }
           }catch(parseErr){
             console.warn("Falha ao parsear JSON da IA:", parseErr.message, "Texto:", text.slice(0,500));
           }
+          parsed._finishReason=finishReason;
           todosItens.push(...(parsed.itens||[]));
           ultimoParsed=parsed;
         }
@@ -552,8 +577,9 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         };
         atualizar(o=>({...o,plantas:[...(o.plantas||[]),novaPlanta]}));
         const totalValor=itensEnriquecidos.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
+        const ultimoFinish=ultimoParsed?._finishReason||"";
         const progMsg=itensEnriquecidos.length===0
-          ?`⚠️ 0 itens — IA respondeu: "${(ultimoParsed?.resumo||ultimoParsed?.disciplina||"sem resumo").slice(0,100)}"`
+          ?`⚠️ 0 itens${ultimoFinish?` [${ultimoFinish}]`:""} — IA: "${(ultimoParsed?.resumo||ultimoParsed?.disciplina||"sem conteúdo detectado").slice(0,100)}"`
           :`✅ ${itensEnriquecidos.length} itens · ${fmtR(totalValor)}`;
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"concluido",progresso:progMsg}:x));
       } catch(e){

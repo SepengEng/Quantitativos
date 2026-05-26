@@ -71,7 +71,7 @@ export async function POST(request) {
   const geminiBody = {
     systemInstruction: body.system ? { parts: [{ text: body.system }] } : undefined,
     contents: [{ role: "user", parts }],
-    generationConfig: { maxOutputTokens: body.max_tokens || 8192 },
+    generationConfig: { maxOutputTokens: body.max_tokens || 32768 },
   };
 
   const data = await chamarGemini(geminiBody, apiKey);
@@ -88,9 +88,13 @@ export async function POST(request) {
     });
   }
 
-  const respParts = data.candidates?.[0]?.content?.parts || [];
+  const candidate = data.candidates?.[0];
+  const finishReason = candidate?.finishReason || "UNKNOWN";
+  const respParts = candidate?.content?.parts || [];
   const textPart = respParts.find(p => p.text && !p.thought) || respParts.find(p => p.text);
   const text = textPart?.text || "{}";
 
-  return Response.json({ content: [{ type: "text", text }] });
+  console.log(`[Gemini] finishReason=${finishReason} textLen=${text.length}`);
+
+  return Response.json({ content: [{ type: "text", text }], finishReason });
 }
