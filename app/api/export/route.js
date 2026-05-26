@@ -2,73 +2,122 @@ import ExcelJS from "exceljs";
 import path from "path";
 import fs from "fs";
 
-// ── Paleta Sepeng ─────────────────────────────────────────────────────────────
-const C = {
-  cabecalho:  "FF1B2A3B", // azul-escuro
-  colHeader:  "FF0E7490", // teal
-  capitulo:   "FF155E75", // teal escuro
-  subCap:     "FFD0F0F8", // azul-claro subcapítulo
-  composicao: "FFFFFFFF", // branco
-  composicaoPar: "FFF8FAFC",
-  material:   "FFFEF9F0", // creme material
-  materialPar:"FFFDF4E1",
-  moObra:     "FFF0FDF4", // verde-claro MO
-  moObraPar:  "FFE8FCF0",
-  totalFundo: "FFD1FAE5",
-  totalBdi:   "FF059669",
-  alerta:     "FFFEF9C3",
-  borda:      "FFD1D5DB",
-  texto:      "FF111827",
-  cinza:      "FF6B7280",
+// ── Fallback quando a IA não fornece MAT/MO separados ────────────────────────
+const PCT_MAT_FB = 0.65;
+const PCT_MO_FB  = 0.35;
+
+// Encargos Sociais SINAPI BA Não Desonerado (dez/2024)
+const ENCARGOS = 68.04;
+
+// Taxas horárias SINAPI BA — usadas quando mo_itens não traz preco
+const LABOR_RATES = {
+  "pedreiro":    14.83, "oficial":      14.83, "armador":      14.83,
+  "carpinteiro": 14.83, "eletricista":  15.50, "encanador":    15.50,
+  "encarregado": 18.50, "servente":      9.12, "montagem":      4.00,
 };
-
-function borda(cell, estilo = "thin") {
-  const b = { style: estilo, color: { argb: C.borda } };
-  cell.border = { top: b, bottom: b, left: b, right: b };
+function laborRate(tipo = "") {
+  const k = Object.keys(LABOR_RATES).find(r => tipo.toLowerCase().includes(r));
+  return k ? LABOR_RATES[k] : 14.83;
 }
 
-function preencher(cell, argb) {
-  cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb } };
-}
-
+// ── Funções auxiliares ─────────────────────────────────────────────────────────
 function num(v) { return typeof v === "number" ? v : parseFloat(v) || 0; }
 
-// Colunas espelhando o F18:
-// A: Cód. | B: Tipo | C-I: Resumo (mesclado) | J: Ud | K: Qte | L: Índ. |
-// M: Comp.Ax.(R$) | N: Comp.(R$) | O: Preço(R$) | P: Valor(R$)
-const COLS = [
-  { key:"cod",   width:14 }, // A
-  { key:"tipo",  width:14 }, // B
-  { key:"c",     width:10 }, // C ┐
-  { key:"d",     width:10 }, // D │
-  { key:"e",     width:10 }, // E │ mescladas → descrição larga
-  { key:"f",     width:10 }, // F │
-  { key:"g",     width:10 }, // G │
-  { key:"h",     width:10 }, // H │
-  { key:"i",     width: 6 }, // I ┘
-  { key:"ud",    width: 8 }, // J
-  { key:"qte",   width:12 }, // K
-  { key:"ind",   width: 8 }, // L índice/coef.
-  { key:"compAx",width:16 }, // M Comp.Ax.
-  { key:"comp",  width:16 }, // N Comp.(R$)
-  { key:"preco", width:16 }, // O Preço(R$)
-  { key:"valor", width:16 }, // P Valor(R$)
-];
-
-// Mescla as colunas C-I de uma linha para a descrição larga
-function mesclarDesc(ws, rowNum) {
-  ws.mergeCells(rowNum, 3, rowNum, 9); // C até I
+// Calcula custo MAT por unidade de composição
+function calcMAT(item) {
+  if (item.mat_preco != null) {
+    const ind = num(item.mat_ind) || 1.0;
+    return item.mat_preco * ind;                // R$/un MAT real
+  }
+  return num(item.preco_sinapi) * PCT_MAT_FB;  // fallback estimado
 }
 
-// Aplica formatação de moeda nas colunas numéricas
-const FMT_NUM = '#,##0.00';
-function formatarNumeros(row) {
-  ["K","L","M","N","O","P"].forEach(col => {
-    row.getCell(col).numFmt = FMT_NUM;
-    row.getCell(col).alignment = { horizontal: "right", vertical: "middle" };
+// Calcula custo MO por unidade de composição + retorna array de sub-itens
+function calcMO(item) {
+  if (item.mo_itens && item.mo_itens.length > 0) {
+    const subItens = item.mo_itens.map(mi => ({
+      tipo:  mi.tipo  || "Mão de obra",
+      un:    mi.un    || "h",
+      ind:   num(mi.ind),
+      preco: num(mi.preco) || laborRate(mi.tipo),
+    }));
+    const moPreco = subItens.reduce((s, mi) => s + mi.ind * mi.preco, 0);
+    return { moPreco, subItens };
+  }
+  // fallback: 60% pedreiro + 40% servente
+  const moPreco = num(item.preco_sinapi) * PCT_MO_FB;
+  const subItens = [
+    { tipo: "Oficial / Pedreiro", un: "h", ind: +(moPreco * 0.6 / 14.83).toFixed(4), preco: 14.83 },
+    { tipo: "Servente",           un: "h", ind: +(moPreco * 0.4 /  9.12).toFixed(4), preco:  9.12 },
+  ];
+  return { moPreco, subItens };
+}
+
+// ── Paleta de cores ────────────────────────────────────────────────────────────
+const C = {
+  cabecalho: "FF1B2A3B",
+  colHeader: "FF0E7490",
+  capitulo:  "FF155E75",
+  matSecBg:  "FFBBDEFB", matSecTxt: "FF0D47A1",
+  matLocBg:  "FFE3F2FD",
+  compBg:    "FFFFFFFF", compParBg: "FFF8FAFC",
+  matBg:     "FFFEF9F0", matParBg:  "FFFDF4E1",
+  moSecBg:   "FFC8E6C9", moSecTxt:  "FF1B5E20",
+  moLocBg:   "FFE8F5E9",
+  moCompBg:  "FFFFFFFF", moCompPar: "FFF0FDF4",
+  moBg:      "FFE8F5E9", moParBg:   "FFD1FAE5",
+  encargBg:  "FFFFF9C3",
+  totalFundo:"FFD1FAE5", totalBdi:  "FF059669",
+  cinza:     "FF6B7280", texto:     "FF111827",
+};
+
+// ── Colunas A–P (espelho F18) ──────────────────────────────────────────────────
+const COLS = [
+  { key:"cod",    width:22 }, // A
+  { key:"tipo",   width:13 }, // B
+  { key:"c",      width:12 }, // C ┐
+  { key:"d",      width:10 }, // D │
+  { key:"e",      width:10 }, // E │ C-I mescladas → descrição
+  { key:"f",      width:10 }, // F │
+  { key:"g",      width:10 }, // G │
+  { key:"h",      width:10 }, // H │
+  { key:"i",      width: 5 }, // I ┘
+  { key:"ud",     width: 8 }, // J
+  { key:"qte",    width:12 }, // K
+  { key:"ind",    width: 8 }, // L
+  { key:"compAx", width:14 }, // M Comp.Ax.
+  { key:"comp",   width:14 }, // N Comp.(R$)
+  { key:"preco",  width:14 }, // O Preço(R$)
+  { key:"valor",  width:16 }, // P Valor(R$)
+];
+
+const FMT = "#,##0.00";
+const FMT_PCT = '0.00"%"';
+
+// CRÍTICO: addRow ANTES de mergeCells — evita linha em branco fantasma
+function addRow(ws, data) {
+  const row = ws.addRow(data);
+  ws.mergeCells(row.number, 3, row.number, 9); // C–I
+  return row;
+}
+
+function numFmt(row, cols) {
+  for (const c of cols) {
+    row.getCell(c).numFmt = FMT;
+    row.getCell(c).alignment = { horizontal: "right", vertical: "middle" };
+  }
+}
+
+function style(row, { bg, bold = false, fs = 9.5, fc = C.texto, h = 16 } = {}) {
+  row.height = h;
+  row.eachCell({ includeEmpty: true }, cell => {
+    if (bg) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: bg } };
+    cell.font      = { bold, size: fs, color: { argb: fc } };
+    cell.alignment = { vertical: "middle" };
   });
 }
 
+// ── Handler principal ──────────────────────────────────────────────────────────
 export async function POST(request) {
   const { obra, bdi = 25 } = await request.json();
   if (!obra) return Response.json({ error: "Obra não informada" }, { status: 400 });
@@ -79,273 +128,336 @@ export async function POST(request) {
 
   const ws = wb.addWorksheet("Orçamento", {
     pageSetup: { paperSize: 9, orientation: "landscape", fitToPage: true, fitToWidth: 1 },
-    views: [{ state: "frozen", ySplit: 5 }], // congela cabeçalho
+    views: [{ state: "frozen", ySplit: 3 }],
   });
-
   ws.columns = COLS;
 
-  // ── Logo ──────────────────────────────────────────────────────────────────
-  const logoPath = path.join(process.cwd(), "public", "logo_sepeng.png");
-  if (fs.existsSync(logoPath)) {
-    const logoId = wb.addImage({ filename: logoPath, extension: "png" });
-    ws.addImage(logoId, { tl: { col: 0, row: 0 }, br: { col: 2, row: 4 } });
-  }
+  // ── Cabeçalho (linhas 1–3) ───────────────────────────────────────────────────
+  const r1 = ws.addRow({});
+  r1.height = 36;
+  ws.mergeCells("A1:P1");
+  Object.assign(r1.getCell("A"), {
+    value: "ORÇAMENTO EXECUTIVO — SEPENG ENGENHARIA",
+    font:  { bold: true, size: 16, color: { argb: "FFFFFFFF" } },
+    fill:  { type: "pattern", pattern: "solid", fgColor: { argb: C.cabecalho } },
+    alignment: { vertical: "middle", horizontal: "center" },
+  });
 
-  // ── Linha 1 — Título ──────────────────────────────────────────────────────
-  ws.mergeCells("C1:P1");
-  const r1 = ws.getRow(1); r1.height = 32;
-  const t1 = r1.getCell("C");
-  t1.value = "ORÇAMENTO EXECUTIVO";
-  t1.font  = { bold: true, size: 18, color: { argb: "FFFFFFFF" } };
-  t1.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: C.cabecalho } };
-  t1.alignment = { vertical: "middle", horizontal: "center" };
+  const r2 = ws.addRow({});
+  r2.height = 18;
+  ws.mergeCells("A2:J2"); ws.mergeCells("K2:P2");
+  r2.getCell("A").value     = `Obra: ${obra.nome || "—"}`;
+  r2.getCell("A").font      = { bold: true, size: 11 };
+  r2.getCell("A").fill      = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F9FF" } };
+  r2.getCell("K").value     = `Data: ${new Date().toLocaleDateString("pt-BR")}   BDI: ${bdi}%`;
+  r2.getCell("K").font      = { italic: true, size: 10 };
+  r2.getCell("K").fill      = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F9FF" } };
+  r2.getCell("K").alignment = { horizontal: "right", vertical: "middle" };
 
-  // ── Linha 2 — Empresa ────────────────────────────────────────────────────
-  ws.mergeCells("C2:P2");
-  const r2 = ws.getRow(2); r2.height = 20;
-  const t2 = r2.getCell("C");
-  t2.value = "SEPENG ENGENHARIA";
-  t2.font  = { bold: true, size: 12, color: { argb: C.colHeader } };
-  t2.fill  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F9FF" } };
-  t2.alignment = { vertical: "middle", horizontal: "center" };
-
-  // ── Linha 3 — Obra e data ────────────────────────────────────────────────
-  ws.mergeCells("C3:J3"); ws.mergeCells("K3:P3");
-  const r3 = ws.getRow(3); r3.height = 18;
-  r3.getCell("C").value = `Obra: ${obra.nome || "—"}`;
-  r3.getCell("C").font  = { bold: true, size: 11 };
-  r3.getCell("C").fill  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F9FF" } };
-  r3.getCell("K").value = `Data: ${new Date().toLocaleDateString("pt-BR")}   BDI: ${bdi}%`;
-  r3.getCell("K").font  = { italic: true, size: 10 };
-  r3.getCell("K").fill  = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F9FF" } };
-  r3.getCell("K").alignment = { horizontal: "right" };
-
-  // ── Linha 4 — cabeçalho das colunas (espelho F18) ────────────────────────
-  ws.mergeCells("C4:I4");
-  const rH = ws.getRow(4); rH.height = 24;
-  const hCols = { A:"Cód.", B:"Tipo", C:"Resumo / Descrição", J:"Ud", K:"Qte",
-                  L:"Índ.", M:"Comp. Ax. (R$)", N:"Comp. (R$)", O:"Preço (R$)", P:"Valor (R$)" };
-  Object.entries(hCols).forEach(([col, label]) => {
+  const rH = ws.addRow({});
+  rH.height = 22;
+  ws.mergeCells("C3:I3");
+  for (const [col, label] of Object.entries({
+    A:"Cód.", B:"Tipo", C:"Resumo / Descrição",
+    J:"Ud", K:"Qtd", L:"Índ.", M:"Comp.Ax.(R$)", N:"Comp.(R$)", O:"Preço(R$)", P:"Valor(R$)",
+  })) {
     const cell = rH.getCell(col);
     cell.value     = label;
     cell.font      = { bold: true, size: 10, color: { argb: "FFFFFFFF" } };
     cell.fill      = { type: "pattern", pattern: "solid", fgColor: { argb: C.colHeader } };
     cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-  });
+  }
 
-  // ── Dados ─────────────────────────────────────────────────────────────────
+  // Logo
+  const logoPath = path.join(process.cwd(), "public", "logo_sepeng.png");
+  if (fs.existsSync(logoPath)) {
+    ws.addImage(wb.addImage({ filename: logoPath, extension: "png" }),
+      { tl: { col: 0, row: 0 }, br: { col: 2, row: 3 } });
+  }
+
+  // ── Agrupa por disciplina ─────────────────────────────────────────────────────
   const plantas = obra.plantas || [];
-
-  // Agrupa por disciplina
-  const grupos = {};
+  const grupos  = {};
   for (const p of plantas) {
     const d = p.disciplina || "Sem disciplina";
     if (!grupos[d]) grupos[d] = [];
     grupos[d].push(p);
   }
+  const disciplinas = Object.entries(grupos);
 
-  let totalObra  = 0;
-  let chapNum    = 1;
-  let iComposicao = 0; // controle zebra
+  // Pré-calcula totais MAT e MO para o capítulo
+  let totalMAT = 0, totalMO = 0;
+  for (const [, gp] of disciplinas) {
+    for (const p of gp) {
+      for (const i of p.itens || []) {
+        const qtd = num(i.qtd);
+        totalMAT += calcMAT(i) * qtd;
+        totalMO  += calcMO(i).moPreco * qtd;
+      }
+    }
+  }
+  const totalObra = totalMAT + totalMO;
 
-  for (const [disc, grupoplantas] of Object.entries(grupos)) {
-    const discTotal = grupoplantas.reduce(
-      (s, p) => s + (p.itens || []).reduce((ss, i) => ss + num(i.preco_sinapi) * num(i.qtd), 0), 0
+  // ── 1 — CAPÍTULO ─────────────────────────────────────────────────────────────
+  const rCap = addRow(ws, { cod: "1", tipo: "Capítulo", c: (obra.nome || "OBRA").toUpperCase(), valor: totalObra });
+  style(rCap, { bg: C.capitulo, bold: true, fs: 11, fc: "FFFFFFFF", h: 22 });
+  numFmt(rCap, ["P"]);
+
+  let zebra = 0;
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // BLOCO MAT  (1.1, 1.2, … — um por disciplina)
+  // ════════════════════════════════════════════════════════════════════════════
+  let matN = 1;
+
+  for (const [disc, gplantas] of disciplinas) {
+    const discMAT = gplantas.reduce(
+      (s, p) => s + (p.itens || []).reduce((ss, i) => ss + calcMAT(i) * num(i.qtd), 0), 0
     );
-    totalObra += discTotal;
 
-    // ── CAPÍTULO (disciplina) ──────────────────────────────────────────────
-    const rowCapN = ws.rowCount + 1;
-    mesclarDesc(ws, rowCapN);
-    const rCap = ws.addRow({
-      cod:  `${chapNum}`,
-      tipo: "Capítulo",
-      c:    disc.toUpperCase(),
-      valor: discTotal,
-    });
-    rCap.height = 20;
-    rCap.eachCell({ includeEmpty: true }, cell => {
-      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.capitulo } };
-      cell.font = { bold: true, size: 10, color: { argb: "FFFFFFFF" } };
-      cell.alignment = { vertical: "middle" };
-    });
-    rCap.getCell("P").numFmt = FMT_NUM;
-    rCap.getCell("P").alignment = { horizontal: "right", vertical: "middle" };
+    // 1.matN — MAT - [Disciplina]
+    const rMatSec = addRow(ws, { cod: `1.${matN}`, c: `MAT - ${disc}`, valor: discMAT });
+    style(rMatSec, { bg: C.matSecBg, bold: true, fs: 10, h: 19 });
+    rMatSec.getCell("A").font = { bold: true, size: 10, color: { argb: C.matSecTxt } };
+    rMatSec.getCell("C").font = { bold: true, size: 10, color: { argb: C.matSecTxt } };
+    rMatSec.getCell("C").alignment = { vertical: "middle" };
+    numFmt(rMatSec, ["P"]);
 
-    let plantaNum = 1;
+    let locN = 1;
+    for (const planta of gplantas) {
+      const plantaMAT = (planta.itens || []).reduce((s, i) => s + calcMAT(i) * num(i.qtd), 0);
 
-    for (const planta of grupoplantas) {
-      const plantaTotal = (planta.itens || []).reduce(
-        (s, i) => s + num(i.preco_sinapi) * num(i.qtd), 0
-      );
+      // 1.matN.locN — localização (usa item.localizacao se disponível, senão fileName)
+      const locLabel = planta.fileName || "Planta";
+      const rLoc = addRow(ws, { cod: `1.${matN}.${locN}`, c: locLabel, valor: plantaMAT });
+      style(rLoc, { bg: C.matLocBg, bold: true, fs: 9.5, h: 17 });
+      rLoc.getCell("C").alignment = { vertical: "middle" };
+      numFmt(rLoc, ["P"]);
 
-      // ── SUBCAPÍTULO (planta) ───────────────────────────────────────────
-      const rowSubN = ws.rowCount + 1;
-      mesclarDesc(ws, rowSubN);
-      const rSub = ws.addRow({
-        cod:  `${chapNum}.${plantaNum}`,
-        tipo: "",
-        c:    planta.fileName || "Planta",
-        valor: plantaTotal,
-      });
-      rSub.height = 17;
-      rSub.eachCell({ includeEmpty: true }, cell => {
-        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.subCap } };
-        cell.font = { bold: true, size: 9.5, color: { argb: C.texto } };
-        cell.alignment = { vertical: "middle" };
-      });
-      rSub.getCell("P").numFmt = FMT_NUM;
-      rSub.getCell("P").alignment = { horizontal: "right", vertical: "middle" };
-
-      // Linha de resumo da planta (escala + descrição IA)
-      if (planta.escala || planta.resumo) {
-        const rowRN = ws.rowCount + 1;
-        ws.mergeCells(rowRN, 3, rowRN, 16); // C até P
-        const rRes = ws.addRow({ c: `  ${planta.escala ? `Escala ${planta.escala} · ` : ""}${(planta.resumo||"").slice(0,220)}` });
-        rRes.height = 13;
-        rRes.getCell("C").font      = { size: 8, italic: true, color: { argb: C.cinza } };
-        rRes.getCell("C").fill      = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF8FAFC" } };
-        rRes.getCell("C").alignment = { wrapText: false };
+      // Agrupa itens por localizacao (campo novo da IA)
+      const byLoc = {};
+      for (const item of planta.itens || []) {
+        const loc = item.localizacao || locLabel;
+        if (!byLoc[loc]) byLoc[loc] = [];
+        byLoc[loc].push(item);
       }
 
-      let itemNum = 1;
+      // Se há múltiplas localizações dentro da planta, cria sub-grupos
+      const locEntries = Object.entries(byLoc);
+      const hasSubLoc  = locEntries.length > 1;
 
-      for (const item of planta.itens || []) {
-        iComposicao++;
-        const isPar   = iComposicao % 2 === 0;
-        const precoUnit = num(item.preco_sinapi);
-        const qtd       = num(item.qtd);
-        const valorItem = precoUnit * qtd;
+      let subLocN = 1;
+      for (const [locName, itensPorLoc] of locEntries) {
+        let compStart = 1;
 
-        // ── COMPOSIÇÃO ────────────────────────────────────────────────────
-        const rowCompN = ws.rowCount + 1;
-        mesclarDesc(ws, rowCompN);
-        const rComp = ws.addRow({
-          cod:   `${chapNum}.${plantaNum}.${itemNum}`,
-          tipo:  "Composição",
-          c:     item.descricao || "",
-          ud:    item.un || "",
-          qte:   qtd || "",
-          preco: precoUnit || "",
-          valor: valorItem || "",
-        });
-        rComp.height = 16;
-        const bgComp = isPar ? C.composicaoPar : C.composicao;
-        rComp.eachCell({ includeEmpty: true }, cell => {
-          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: bgComp } };
-          cell.font = { size: 9.5, bold: false };
-          cell.alignment = { vertical: "middle" };
-        });
-        rComp.getCell("B").font = { size: 9, italic: true, color: { argb: C.cinza } };
-        rComp.getCell("K").numFmt = FMT_NUM;
-        rComp.getCell("O").numFmt = FMT_NUM;
-        rComp.getCell("P").numFmt = FMT_NUM;
-        ["K","O","P"].forEach(c => rComp.getCell(c).alignment = { horizontal:"right", vertical:"middle" });
-
-        // ── MATERIAL (sub-item — espelho do F18) ──────────────────────────
-        // Usa o código + descrição SINAPI como material, índice padrão 1,00
-        const sinapiDesc = item.sinapi_descricao || item.descricao || "";
-        const sinapiCod  = item.sinapi_sugerido  || "";
-        const indice     = 1.00;
-        const precoMat   = precoUnit; // preço SINAPI = preço do material base
-
-        const rowMatN = ws.rowCount + 1;
-        mesclarDesc(ws, rowMatN);
-        const bgMat = isPar ? C.materialPar : C.material;
-        const rMat = ws.addRow({
-          cod:    `${chapNum}.${plantaNum}.${itemNum}.1`,
-          tipo:   "Material",
-          c:      sinapiDesc + (sinapiCod ? `  [SINAPI ${sinapiCod}]` : ""),
-          ud:     item.un || "",
-          qte:    qtd * indice,
-          ind:    indice,
-          comp:   precoMat || "",
-          preco:  precoMat || "",
-          valor:  valorItem || "",
-        });
-        rMat.height = 14;
-        rMat.eachCell({ includeEmpty: true }, cell => {
-          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: bgMat } };
-          cell.font = { size: 9, color: { argb: C.texto } };
-          cell.alignment = { vertical: "middle" };
-        });
-        rMat.getCell("B").font  = { size: 9, color: { argb: "FF0E7490" } };
-        rMat.getCell("A").font  = { size: 8.5, color: { argb: C.cinza } };
-        formatarNumeros(rMat);
-
-        // Fonte de medição como sub-linha de Mão de Obra (se tiver info)
-        if (item.fonte && item.fonte !== "🔍 Inferência") {
-          const rowMoN = ws.rowCount + 1;
-          mesclarDesc(ws, rowMoN);
-          const bgMo = isPar ? C.moObraPar : C.moObra;
-          const rMo = ws.addRow({
-            cod:  `${chapNum}.${plantaNum}.${itemNum}.2`,
-            tipo: "Mão de obra",
-            c:    `Medição: ${item.fonte}${item.obs ? " · " + item.obs.slice(0, 120) : ""}`,
-            ud:   item.un || "",
-            qte:  qtd,
-          });
-          rMo.height = 13;
-          rMo.eachCell({ includeEmpty: true }, cell => {
-            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: bgMo } };
-            cell.font = { size: 8.5, italic: true, color: { argb: C.cinza } };
-            cell.alignment = { vertical: "middle" };
-          });
+        if (hasSubLoc) {
+          // Sub-localização: 1.matN.locN.subLocN
+          const subTotal = itensPorLoc.reduce((s, i) => s + calcMAT(i) * num(i.qtd), 0);
+          const rSubLoc  = addRow(ws, { cod: `1.${matN}.${locN}.${subLocN}`, c: locName, valor: subTotal });
+          style(rSubLoc, { bg: "FFE1F5FE", bold: false, fs: 9, h: 15 });
+          rSubLoc.getCell("C").alignment = { vertical: "middle" };
+          numFmt(rSubLoc, ["P"]);
         }
 
-        itemNum++;
-      }
+        for (const item of itensPorLoc) {
+          zebra++;
+          const par      = zebra % 2 === 0;
+          const qtd      = num(item.qtd);
+          const matPreco = calcMAT(item);
+          const matValor = matPreco * qtd;
+          const compCod  = hasSubLoc
+            ? `1.${matN}.${locN}.${subLocN}.${compStart}`
+            : `1.${matN}.${locN}.${compStart}`;
 
-      // Alertas da planta
-      if ((planta.alertas || []).length > 0) {
-        const rowAlN = ws.rowCount + 1;
-        ws.mergeCells(rowAlN, 3, rowAlN, 16);
-        const rAl = ws.addRow({ c: `⚠  ${planta.alertas.join(" · ").slice(0, 280)}` });
-        rAl.height = 13;
-        rAl.getCell("C").font = { size: 8.5, italic: true, color: { argb: "FFB45309" } };
-        rAl.getCell("C").fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.alerta } };
-      }
+          // Composição
+          const rComp = addRow(ws, {
+            cod:   compCod,
+            tipo:  "Composição",
+            c:     item.mat_descricao || item.descricao || "",
+            ud:    item.un || "",
+            qte:   qtd || "",
+            preco: matPreco || "",
+            valor: matValor || "",
+          });
+          style(rComp, { bg: par ? C.compParBg : C.compBg, fs: 9.5, h: 16 });
+          rComp.getCell("B").font      = { size: 9, italic: true, color: { argb: C.cinza } };
+          rComp.getCell("C").alignment = { vertical: "middle", wrapText: false };
+          numFmt(rComp, ["K", "O", "P"]);
 
-      plantaNum++;
+          // Material sub-linha
+          const matSinapi = item.mat_sinapi || item.sinapi_sugerido || "";
+          const matDesc   = item.mat_descricao || item.descricao || "";
+          const matLabel  = matSinapi ? `${matDesc}  [SINAPI ${matSinapi}]` : matDesc;
+          const matInd    = num(item.mat_ind) || 1.00;
+          const matPUnit  = item.mat_preco || matPreco; // preço do insumo
+
+          const rMat = addRow(ws, {
+            cod:   `${compCod}.1`,
+            tipo:  "Material",
+            c:     matLabel,
+            ud:    item.un || "",
+            qte:   qtd * matInd,
+            ind:   matInd,
+            comp:  matPUnit || "",
+            preco: matPreco || "",
+            valor: matValor || "",
+          });
+          style(rMat, { bg: par ? C.matParBg : C.matBg, fs: 9, h: 14 });
+          rMat.getCell("B").font      = { size: 9, color: { argb: "FF0E7490" } };
+          rMat.getCell("A").font      = { size: 8.5, color: { argb: C.cinza } };
+          rMat.getCell("C").alignment = { vertical: "middle", wrapText: false };
+          numFmt(rMat, ["K", "L", "N", "O", "P"]);
+
+          compStart++;
+        }
+        subLocN++;
+      }
+      locN++;
     }
-    chapNum++;
+    matN++;
   }
 
-  // ── Totais (espelho F18) ──────────────────────────────────────────────────
+  // ════════════════════════════════════════════════════════════════════════════
+  // BLOCO M.O.  (1.matN — uma seção única)
+  // ════════════════════════════════════════════════════════════════════════════
+  const moSecN = matN;
+
+  const rMoSec = addRow(ws, { cod: `1.${moSecN}`, c: `M.O. - ${obra.nome || "OBRA"}`, valor: totalMO });
+  style(rMoSec, { bg: C.moSecBg, bold: true, fs: 10, h: 19 });
+  rMoSec.getCell("A").font      = { bold: true, size: 10, color: { argb: C.moSecTxt } };
+  rMoSec.getCell("C").font      = { bold: true, size: 10, color: { argb: C.moSecTxt } };
+  rMoSec.getCell("C").alignment = { vertical: "middle" };
+  numFmt(rMoSec, ["P"]);
+
+  let moLocN = 1;
+  for (const [disc, gplantas] of disciplinas) {
+    for (const planta of gplantas) {
+      const plantaMO = (planta.itens || []).reduce((s, i) => s + calcMO(i).moPreco * num(i.qtd), 0);
+
+      // Localização MO
+      const rMoLoc = addRow(ws, {
+        cod:   `1.${moSecN}.${moLocN}`,
+        c:     `${disc} — ${planta.fileName || "Planta"}`,
+        valor: plantaMO,
+      });
+      style(rMoLoc, { bg: C.moLocBg, bold: true, fs: 9.5, h: 17 });
+      rMoLoc.getCell("C").alignment = { vertical: "middle" };
+      numFmt(rMoLoc, ["P"]);
+
+      let compN = 1;
+      for (const item of planta.itens || []) {
+        // Itens sem MO (só fornecimento) → pula
+        if (!item.mo_itens && !num(item.preco_sinapi)) { compN++; continue; }
+
+        zebra++;
+        const par          = zebra % 2 === 0;
+        const qtd          = num(item.qtd);
+        const { moPreco, subItens } = calcMO(item);
+        const moValor      = moPreco * qtd;
+        const moSinapi     = item.mo_sinapi || "";
+        const moDesc       = item.mo_descricao
+          ? `${item.mo_descricao}${moSinapi ? `  [SINAPI ${moSinapi}]` : ""}`
+          : `Instalação/Execução: ${item.descricao || ""}`;
+
+        // Composição MO
+        const rMoComp = addRow(ws, {
+          cod:   `1.${moSecN}.${moLocN}.${compN}`,
+          tipo:  "Composição",
+          c:     moDesc,
+          ud:    item.un || "",
+          qte:   qtd || "",
+          preco: moPreco || "",
+          valor: moValor || "",
+        });
+        style(rMoComp, { bg: par ? C.moCompPar : C.moCompBg, fs: 9, h: 15 });
+        rMoComp.getCell("B").font      = { size: 9, italic: true, color: { argb: C.cinza } };
+        rMoComp.getCell("C").alignment = { vertical: "middle", wrapText: false };
+        numFmt(rMoComp, ["K", "O", "P"]);
+
+        // Sub-linhas de Mão de obra
+        let moSubN = 1;
+        let laborTotal = 0;
+        for (const mi of subItens) {
+          const miValor = mi.ind * mi.preco * qtd;
+          laborTotal   += miValor;
+
+          const rMi = addRow(ws, {
+            cod:   `1.${moSecN}.${moLocN}.${compN}.${moSubN}`,
+            tipo:  "Mão de obra",
+            c:     mi.tipo,
+            ud:    mi.un,
+            qte:   qtd * mi.ind,
+            ind:   mi.ind,
+            comp:  mi.preco,
+            preco: mi.preco,
+            valor: miValor,
+          });
+          style(rMi, { bg: par ? C.moParBg : C.moBg, fs: 8.5, h: 13 });
+          rMi.getCell("B").font      = { size: 8.5, color: { argb: "FF059669" } };
+          rMi.getCell("A").font      = { size: 8, color: { argb: C.cinza } };
+          rMi.getCell("C").alignment = { vertical: "middle", wrapText: false };
+          numFmt(rMi, ["K", "L", "N", "O", "P"]);
+          moSubN++;
+        }
+
+        // Encargos Sociais
+        const encargosValor = laborTotal * ENCARGOS / 100;
+        const rEnc = addRow(ws, {
+          cod:   `1.${moSecN}.${moLocN}.${compN}.${moSubN}`,
+          tipo:  "",
+          c:     "Encargos Sociais",
+          ud:    "%",
+          ind:   ENCARGOS,
+          valor: encargosValor,
+        });
+        style(rEnc, { bg: C.encargBg, fs: 8, h: 12 });
+        rEnc.getCell("A").font      = { size: 8, color: { argb: C.cinza } };
+        rEnc.getCell("C").font      = { size: 8, italic: true, color: { argb: C.cinza } };
+        rEnc.getCell("C").alignment = { vertical: "middle", wrapText: false };
+        rEnc.getCell("L").numFmt    = FMT_PCT;
+        rEnc.getCell("L").alignment = { horizontal: "right", vertical: "middle" };
+        numFmt(rEnc, ["P"]);
+
+        compN++;
+      }
+      moLocN++;
+    }
+  }
+
+  // ── Totais ────────────────────────────────────────────────────────────────────
   ws.addRow({});
 
-  ws.mergeCells(`A${ws.rowCount + 1}:O${ws.rowCount + 1}`);
   const rT1 = ws.addRow({ cod: "TOTAL SEM BDI", valor: totalObra });
+  ws.mergeCells(rT1.number, 1, rT1.number, 15);
   rT1.height = 22;
-  rT1.eachCell({ includeEmpty: true }, cell => {
-    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.totalFundo } };
-    cell.font = { bold: true, size: 12 };
+  rT1.eachCell({ includeEmpty: true }, c => {
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.totalFundo } };
+    c.font = { bold: true, size: 12 };
   });
-  rT1.getCell("A").alignment = { horizontal: "right" };
-  rT1.getCell("P").numFmt = FMT_NUM;
-  rT1.getCell("P").alignment = { horizontal: "right" };
+  rT1.getCell("A").alignment = { horizontal: "right", vertical: "middle" };
+  numFmt(rT1, ["P"]);
 
-  ws.mergeCells(`A${ws.rowCount + 1}:O${ws.rowCount + 1}`);
   const rT2 = ws.addRow({ cod: `TOTAL COM BDI ${bdi}%`, valor: totalObra * (1 + bdi / 100) });
+  ws.mergeCells(rT2.number, 1, rT2.number, 15);
   rT2.height = 26;
-  rT2.eachCell({ includeEmpty: true }, cell => {
-    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.totalBdi } };
-    cell.font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
+  rT2.eachCell({ includeEmpty: true }, c => {
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.totalBdi } };
+    c.font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
   });
-  rT2.getCell("A").alignment = { horizontal: "right" };
-  rT2.getCell("P").numFmt = FMT_NUM;
-  rT2.getCell("P").alignment = { horizontal: "right" };
+  rT2.getCell("A").alignment = { horizontal: "right", vertical: "middle" };
+  numFmt(rT2, ["P"]);
 
-  // ── Rodapé ────────────────────────────────────────────────────────────────
+  // Rodapé
   ws.addRow({});
-  const rowRod = ws.rowCount + 1;
-  ws.mergeCells(rowRod, 1, rowRod, 16);
-  const rRod = ws.addRow({ cod: `Gerado por Quantitativos IA · Sepeng Engenharia · ${new Date().toLocaleDateString("pt-BR")} · ${plantas.length} plantas analisadas` });
+  const rodTxt = `Gerado por Quantitativos IA · Sepeng Engenharia · ${new Date().toLocaleDateString("pt-BR")} · `
+    + `${plantas.length} plantas · MAT e MO baseados em códigos SINAPI BA (Não Desonerado)`;
+  const rRod = ws.addRow({ cod: rodTxt });
+  ws.mergeCells(rRod.number, 1, rRod.number, 16);
   rRod.getCell("A").font      = { size: 8, italic: true, color: { argb: C.cinza } };
   rRod.getCell("A").alignment = { horizontal: "center" };
 
-  // ── Buffer ────────────────────────────────────────────────────────────────
-  const buf = await wb.xlsx.writeBuffer();
+  // ── Buffer ────────────────────────────────────────────────────────────────────
+  const buf  = await wb.xlsx.writeBuffer();
   const nome = `ORC_${(obra.nome || "Obra").replace(/[^a-zA-Z0-9]/g, "_").slice(0, 30)}_BDI${bdi}.xlsx`;
 
   return new Response(buf, {

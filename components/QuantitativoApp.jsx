@@ -12,13 +12,16 @@ function getSinapiPrecoLocal(codigo) {
   return SINAPI_MAP[key]?.preco || null;
 }
 
-// Resolve preços: 1º por código, 2º por descrição (banco completo 12.638 itens)
+// Resolve preços: 1º por código (sinapi_sugerido + mat_sinapi), 2º por descrição
 async function resolverPrecosBatch(itens) {
   const resultado = {};
   const semPreco  = [];
 
-  // 1ª passagem: batch por código
-  const codigos = [...new Set(itens.map(i => i.sinapi_sugerido).filter(Boolean))];
+  // 1ª passagem: batch por código — inclui mat_sinapi para resolução MAT/MO real
+  const codigos = [...new Set([
+    ...itens.map(i => i.sinapi_sugerido),
+    ...itens.map(i => i.mat_sinapi),
+  ].filter(Boolean))];
   if (codigos.length) {
     try {
       const r = await fetch(`/api/sinapi?codigos=${encodeURIComponent(codigos.join(","))}`);
@@ -40,7 +43,6 @@ async function resolverPrecosBatch(itens) {
       const d = await r.json();
       if (d.item?.preco) {
         resultado[it.sinapi_sugerido || desc] = d.item.preco;
-        // atualiza o código para o real encontrado
         it._sinapi_real = { codigo: d.item.codigo, descricao: d.item.descricao, preco: d.item.preco };
       }
     } catch {}
@@ -158,7 +160,8 @@ Fonte de medição a usar em cada item:
 "🔍 Inferência" = estimado por escala, tabela de armação ou prática construtiva
 
 Retorne APENAS JSON válido sem texto antes ou depois:
-{"disciplina":"...","escala":"1:XX","resumo":"descrição do que o desenho representa e principais dimensões encontradas","itens":[{"codigo_item":"XXX-001","descricao":"descrição técnica completa do serviço","un":"m|m²|m³|un|kg","qtd":0.00,"fonte":"📐 Cota","obs":"como foi medido especificamente","sinapi_sugerido":"XXXXX","sinapi_descricao":"descrição curta SINAPI"}],"alertas":["itens a confirmar em campo"]}`;
+{"disciplina":"...","escala":"1:XX","resumo":"descrição do que o desenho representa e principais dimensões encontradas","itens":[{"codigo_item":"XXX-001","localizacao":"Local/aplicação no projeto (ex: Fundação - Sapatas, Piso térreo, Fachada norte)","descricao":"descrição técnica completa do serviço","un":"m|m²|m³|un|kg","qtd":0.00,"fonte":"📐 Cota","obs":"como foi medido especificamente","sinapi_sugerido":"XXXXX","sinapi_descricao":"descrição curta SINAPI","mat_sinapi":"XXXXX","mat_descricao":"Fornecimento de [material específico]","mat_ind":1.00,"mo_sinapi":"XXXXX","mo_descricao":"Execução/Instalação de [serviço]","mo_itens":[{"tipo":"Pedreiro","un":"h","ind":1.5},{"tipo":"Servente","un":"h","ind":2.0}]}],"alertas":["itens a confirmar em campo"]}
+Nota: para itens só-MAT (fornecimento puro) omita mo_sinapi/mo_itens; para itens só-MO omita mat_sinapi/mat_ind.`;
 
 const PROMPTS = {
 "Arquitetura":`Especialista em arquitetura predial. Extraia: PAREDES (m e m² por segmento — alvenaria e drywall separados), PISOS (m² por ambiente e tipo), ESQUADRIAS (tipo, dimensões, contagem), REVESTIMENTOS (m² por tipo), COBERTURA (m² e tipo), LOUÇAS (símbolo a símbolo), SPLITS (BTU anotados).
@@ -621,7 +624,9 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           // Se encontrou match por descrição, usa os dados reais
           sinapi_sugerido: it._sinapi_real?.codigo || it.sinapi_sugerido,
           sinapi_descricao: it._sinapi_real?.descricao || it.sinapi_descricao,
-          preco_sinapi: it._sinapi_real?.preco || precoMap[it.sinapi_sugerido] || null
+          preco_sinapi: it._sinapi_real?.preco || precoMap[it.sinapi_sugerido] || null,
+          // Preço real do insumo MAT (Opção A — separação MAT/MO real)
+          mat_preco: precoMap[it.mat_sinapi] || null,
         }));
         const nPrecos = itensEnriquecidos.filter(i=>i.preco_sinapi).length;
         console.log(`SINAPI: ${nPrecos}/${itensEnriquecidos.length} itens com preço`);
