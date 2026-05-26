@@ -519,11 +519,39 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   const [orcando,setOrcando]       = useState(false);
   const [dragOver,setDragOver]     = useState(false);
   const [erro,setErro]             = useState("");
+  const [verificandoGeral,setVerificandoGeral] = useState(false);
+  const [verificacaoGeral,setVerificacaoGeral] = useState(null);
   const fileRef = useRef();
-  const ultimaRequisicao = useRef(0); // timestamp do último fetch à API (throttle global)
+  const ultimaRequisicao = useRef(0);
   const cliente = clientes.find(c=>c.id===obra.clienteId);
   const atualizar = (fn)=>setObras(p=>p.map(o=>o.id===obra.id?fn(o):o));
   const obraAtual = obras.find(o=>o.id===obra.id);
+
+  const verificarTodasPlantas = async () => {
+    const todasPlantas = obraAtual?.plantas || [];
+    if (!todasPlantas.length || verificandoGeral) return;
+    setVerificandoGeral(true); setVerificacaoGeral(null);
+    try {
+      const resumo = todasPlantas.map(p => {
+        const itensStr = (p.itens||[]).map(i =>
+          `  ${i.codigo_item}: ${i.descricao} (${i.qtd} ${i.un}) conf:${i.confianca||"?"}`
+        ).join("\n");
+        return `[${p.disciplina||"??"} — ${p.fileName}]\n${itensStr||"  (sem itens)"}`;
+      }).join("\n\n");
+      const promptVerif = `Você é um orçamentista sênior revisando todos os quantitativos da obra "${obra.nome}".\n\nItens por planta:\n${resumo}\n\nAnalise e identifique:\n1. Quantidades fora da escala esperada para este tipo de obra\n2. Itens que parecem duplicados entre disciplinas\n3. Serviços que provavelmente estão faltando (ex: impermeabilização sem armação, elétrica sem aterramento)\n4. Inconsistências entre disciplinas (ex: área de piso diferente da área de forro)\n\nRetorne APENAS JSON: {"flags":[{"planta":"nome do arquivo","codigo_item":"XXX-001","problema":"descrição","sugestao":"ação sugerida","gravidade":"alta|media|baixa"}],"resumo_geral":"avaliação geral da consistência do orçamento"}`;
+      const reqBody = JSON.stringify({model:"claude-sonnet-4-6",max_tokens:8192,system:promptVerif,
+        messages:[{role:"user",content:[{type:"text",text:"Revise todos os quantitativos desta obra."}]}]});
+      const resp = await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
+      const data = await resp.json();
+      const text = data.content?.find(b=>b.type==="text")?.text||"{}";
+      const clean = text.replace(/```json|```/g,"").trim();
+      const json  = JSON.parse(clean.match(/\{[\s\S]*\}/)?.[0]||"{}");
+      setVerificacaoGeral(json);
+    } catch(e) {
+      setVerificacaoGeral({flags:[],resumo_geral:`Erro: ${e.message}`});
+    }
+    setVerificandoGeral(false);
+  };
 
   const pdfParaImagens = (file)=>new Promise((resolve,reject)=>{
     const go=()=>{
@@ -747,10 +775,42 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         {cliente&&<div style={{fontSize:12,color:"#6b7280",marginBottom:4}}>{cliente.nome}</div>}
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}}>
           <h1 style={{fontSize:22,fontWeight:700,margin:0}}>{obra.nome}</h1>
-          {totalOrcado>0&&<div style={{fontSize:14,fontWeight:700,color:"#059669"}}>{fmtR(totalOrcado)} <span style={{fontSize:12,fontWeight:400,color:"#6b7280"}}>sem BDI</span></div>}
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            {totalOrcado>0&&<div style={{fontSize:14,fontWeight:700,color:"#059669"}}>{fmtR(totalOrcado)} <span style={{fontSize:12,fontWeight:400,color:"#6b7280"}}>sem BDI</span></div>}
+            {plantas.length>0&&(
+              <button onClick={verificarTodasPlantas} disabled={verificandoGeral} style={{...S.btn,fontSize:12,display:"flex",alignItems:"center",gap:6,opacity:verificandoGeral?0.7:1}}>
+                {verificandoGeral?<><span style={{animation:"spin 1s linear infinite",display:"inline-block"}}>⚙️</span> Verificando...</>:"🔍 Verificar IA"}
+              </button>
+            )}
+          </div>
         </div>
         {obra.descricao&&<p style={{fontSize:13,color:"#6b7280",margin:"4px 0 0"}}>{obra.descricao}</p>}
       </div>
+
+      {/* Painel de verificação geral */}
+      {verificacaoGeral&&(
+        <div style={{...S.card,padding:16,marginBottom:16,border:"1px solid #bae6fd",background:"#f0f9ff"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+            <div style={{fontSize:13,fontWeight:700,color:"#0369a1"}}>🔍 Verificação IA — {verificacaoGeral.flags?.length||0} flag{verificacaoGeral.flags?.length!==1?"s":""} encontrada{verificacaoGeral.flags?.length!==1?"s":""}</div>
+            <button onClick={()=>setVerificacaoGeral(null)} style={{fontSize:12,color:"#9ca3af",background:"none",border:"none",cursor:"pointer"}}>✕</button>
+          </div>
+          {verificacaoGeral.resumo_geral&&<div style={{fontSize:12,color:"#0c4a6e",marginBottom:10,padding:"8px 12px",background:"#e0f2fe",borderRadius:8}}>{verificacaoGeral.resumo_geral}</div>}
+          {(verificacaoGeral.flags||[]).length>0&&(
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {(verificacaoGeral.flags||[]).map((f,k)=>(
+                <div key={k} style={{display:"flex",gap:10,padding:"8px 10px",borderRadius:8,background:"#fff",border:"1px solid #e0f2fe",alignItems:"flex-start"}}>
+                  <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,flexShrink:0,marginTop:1,background:f.gravidade==="alta"?"#fee2e2":f.gravidade==="media"?"#fef3c7":"#f3f4f6",color:f.gravidade==="alta"?"#991b1b":f.gravidade==="media"?"#92400e":"#374151"}}>{f.gravidade}</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:11,color:"#6b7280",marginBottom:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.planta} {f.codigo_item&&<span style={{fontFamily:"monospace",color:"#0369a1"}}>· {f.codigo_item}</span>}</div>
+                    <div style={{fontSize:12,color:"#374151"}}>{f.problema}</div>
+                    {f.sugestao&&<div style={{fontSize:11,color:"#0369a1",marginTop:2}}>→ {f.sugestao}</div>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Dica de nomenclatura */}
       <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:"#166534"}}>
