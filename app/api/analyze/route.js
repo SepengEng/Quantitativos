@@ -10,6 +10,7 @@ const MODELOS = [
 
 async function chamarGemini(geminiBody, apiKey) {
   let lastError = null;
+  let anyRateLimit = false;
 
   for (const modelo of MODELOS) {
     const response = await fetch(
@@ -22,9 +23,11 @@ async function chamarGemini(geminiBody, apiKey) {
     );
     const data = await response.json();
 
-    if (data.error?.code === 429) {
+    if (data.error) {
       lastError = data.error;
-      console.log(`[Gemini] ${modelo} rate limited — próximo modelo`);
+      const isRL = data.error.code === 429 || data.error.status === "RESOURCE_EXHAUSTED";
+      if (isRL) anyRateLimit = true;
+      console.log(`[Gemini] ${modelo} erro ${data.error.code || data.error.status || "?"} — próximo modelo`);
       continue;
     }
 
@@ -32,11 +35,14 @@ async function chamarGemini(geminiBody, apiKey) {
     return data;
   }
 
-  // Todos os modelos esgotados — extrai tempo de espera do último erro
-  const msg = lastError?.message || "Todos os modelos Gemini atingiram o rate limit";
-  const retryMatch = (msg).match(/retry.*?(\d+(?:\.\d+)?)s/i);
-  const retryAfter = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 30;
-  return { error: { code: 429, type: "rate_limit", message: msg, retryAfter } };
+  // Todos os modelos falharam
+  const msg = lastError?.message || "Todos os modelos Gemini falharam";
+  if (anyRateLimit) {
+    const retryMatch = msg.match(/retry.*?(\d+(?:\.\d+)?)s/i);
+    const retryAfter = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 30;
+    return { error: { code: 429, type: "rate_limit", message: msg, retryAfter } };
+  }
+  return { error: { code: lastError?.code || 500, type: "gemini_error", message: msg } };
 }
 
 export async function POST(request) {

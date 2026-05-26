@@ -413,6 +413,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   const [dragOver,setDragOver]     = useState(false);
   const [erro,setErro]             = useState("");
   const fileRef = useRef();
+  const ultimaRequisicao = useRef(0); // timestamp do último fetch à API (throttle global)
   const cliente = clientes.find(c=>c.id===obra.clienteId);
   const atualizar = (fn)=>setObras(p=>p.map(o=>o.id===obra.id?fn(o):o));
   const obraAtual = obras.find(o=>o.id===obra.id);
@@ -497,12 +498,17 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
                 :`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}`}
             ]}]
           });
-          const chamar=()=>fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
+          // Throttle: garante intervalo mínimo de 3.5s entre requisições (≤17 RPM global)
+          const agora=Date.now();
+          const espThrottle=3500-(agora-ultimaRequisicao.current);
+          if(espThrottle>0) await new Promise(r=>setTimeout(r,espThrottle));
+          ultimaRequisicao.current=Date.now();
+          const chamar=()=>{ultimaRequisicao.current=Date.now();return fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});};
           let data=await (await chamar()).json();
-          // Rate limit — retenta até 5x esperando o tempo sugerido
-          for(let rt=0;rt<5&&data.error?.type==="rate_limit";rt++){
+          // Rate limit — retenta até 8x esperando o tempo sugerido
+          for(let rt=0;rt<8&&data.error?.type==="rate_limit";rt++){
             const espera=(data.error.retryAfter||30)*1000;
-            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/5)...`}:x));
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/8)...`}:x));
             await new Promise(r=>setTimeout(r,espera));
             data=await (await chamar()).json();
           }
