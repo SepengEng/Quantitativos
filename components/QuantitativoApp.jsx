@@ -456,8 +456,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         if(file.type==="application/pdf"){
           // Envia PDF diretamente ao Gemini (suporte nativo — preserva qualidade de CAD/DWG)
           const base64=await toB64(file);
+          const tamanhoMB=(file.size/1024/1024).toFixed(1);
           imgs=[{base64,type:"application/pdf"}];
-          progDesc="PDF completo";
+          // Base64 aumenta ~33% — avisa se próximo do limite de 4,5 MB do Vercel
+          progDesc=file.size>3_000_000?`PDF completo · ⚠️ ${tamanhoMB} MB (grande)`:`PDF completo · ${tamanhoMB} MB`;
         } else if(file.type.startsWith("image/")){
           imgs=[{base64:await toB64(file),type:file.type}];
           progDesc=`${imgs.length} pág.`;
@@ -503,14 +505,20 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           const espThrottle=3500-(agora-ultimaRequisicao.current);
           if(espThrottle>0) await new Promise(r=>setTimeout(r,espThrottle));
           ultimaRequisicao.current=Date.now();
-          const chamar=()=>{ultimaRequisicao.current=Date.now();return fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});};
-          let data=await (await chamar()).json();
+          const chamar=async()=>{
+            ultimaRequisicao.current=Date.now();
+            const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
+            if(resp.status===413) return {error:{type:"file_too_large",message:"PDF muito grande (>4,5 MB). Tente comprimir ou dividir o arquivo."}};
+            try{ return await resp.json(); }
+            catch{ return {error:{type:"parse_error",message:`Resposta inesperada do servidor (HTTP ${resp.status})`}}; }
+          };
+          let data=await chamar();
           // Rate limit — retenta até 8x esperando o tempo sugerido
           for(let rt=0;rt<8&&data.error?.type==="rate_limit";rt++){
             const espera=(data.error.retryAfter||30)*1000;
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/8)...`}:x));
             await new Promise(r=>setTimeout(r,espera));
-            data=await (await chamar()).json();
+            data=await chamar();
           }
           if(data.error){
             throw new Error(`Gemini API: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
