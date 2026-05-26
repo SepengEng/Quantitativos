@@ -780,7 +780,31 @@ function VisualizadorPlanta({planta,obra,onBack}) {
   const cobertura   = itens.length?Math.round((comPreco.length/itens.length)*100):0;
   const col         = DISC_COR[planta.disciplina]||{};
 
-  const exportar=()=>{
+  const exportarExcel = async (obraAlvo) => {
+    if (!obraAlvo || exportando) return;
+    setExportando(true);
+    try {
+      const resp = await fetch("/api/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ obra: obraAlvo, bdi }),
+      });
+      if (!resp.ok) throw new Error(`Erro HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `ORC_${(obraAlvo.nome||"Obra").replace(/[^a-zA-Z0-9]/g,"_").slice(0,30)}_BDI${bdi}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch(e) {
+      alert("Erro ao exportar: " + e.message);
+    } finally {
+      setExportando(false);
+    }
+  };
+
+    const exportar=()=>{
     const rows=["\uFEFFCódigo,Descrição,Un.,Qtd.,Fonte,SINAPI,Preço Unit.,Subtotal,c/BDI,Obs."];
     filtrados.forEach(it=>{const sub=(it.preco_sinapi||0)*(it.qtd||0);rows.push(`"${it.codigo_item}","${it.descricao}","${it.un}","${it.qtd}","${it.fonte}","${it.sinapi_sugerido||""}","${it.preco_sinapi||""}","${sub.toFixed(2)}","${(sub*(1+bdi/100)).toFixed(2)}","${it.obs||""}"`);});
     rows.push(`"","","","","","","TOTAL SEM BDI","${totalSemBdi.toFixed(2)}","",""`);
@@ -937,9 +961,10 @@ function SecaoSinapi() {
 
 // ─── ORÇAMENTO ────────────────────────────────────────────────────────────────
 function SecaoOrcamento({obras}) {
-  const [obraId,setObraId]     = useState("");
-  const [plantaId,setPlantaId] = useState("");
-  const [bdi,setBdi]           = useState(25);
+  const [obraId,setObraId]       = useState("");
+  const [plantaId,setPlantaId]   = useState("");
+  const [bdi,setBdi]             = useState(25);
+  const [exportando,setExportando] = useState(false);
 
   const obra   = obras.find(o=>o.id===obraId);
   const planta = obra?.plantas?.find(p=>p.id===plantaId);
@@ -995,7 +1020,12 @@ function SecaoOrcamento({obras}) {
         <div style={{...S.card,overflow:"hidden",marginBottom:20}}>
           <div style={{padding:"12px 16px",borderBottom:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
             <span style={{fontSize:13,fontWeight:600}}>{obra.nome} — Resumo por disciplina</span>
-            <span style={{fontSize:14,fontWeight:700,color:"#059669"}}>{fmtR(totalObra*(1+bdi/100))} <span style={{fontSize:11,fontWeight:400,color:"#6b7280"}}>c/ BDI {bdi}%</span></span>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <span style={{fontSize:14,fontWeight:700,color:"#059669"}}>{fmtR(totalObra*(1+bdi/100))} <span style={{fontSize:11,fontWeight:400,color:"#6b7280"}}>c/ BDI {bdi}%</span></span>
+              <button onClick={()=>exportarExcel(obra)} disabled={exportando} style={{...S.btnPrimary,padding:"6px 14px",fontSize:12,background:"#059669",opacity:exportando?0.6:1}}>
+                {exportando?"⏳ Gerando...":"↓ Excel (.xlsx)"}
+              </button>
+            </div>
           </div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
             <thead><tr>{["Disciplina","Plantas","Itens","Total sem BDI",`Total c/BDI ${bdi}%`].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
@@ -1036,7 +1066,12 @@ function SecaoOrcamento({obras}) {
             ))}
           </div>
           <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
-            <button onClick={exportar} style={S.btnPrimary}>↓ Exportar CSV</button>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={exportar} style={S.btn}>↓ CSV</button>
+              <button onClick={()=>exportarExcel(obra)} disabled={exportando} style={{...S.btnPrimary,background:"#059669",opacity:exportando?0.6:1}}>
+                {exportando?"⏳ Gerando...":"↓ Excel (.xlsx)"}
+              </button>
+            </div>
           </div>
           <div style={{...S.card,overflow:"hidden"}}>
             <div style={{overflowX:"auto"}}>
