@@ -564,8 +564,26 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       const resp = await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
       const data = await resp.json();
       const text = data.content?.find(b=>b.type==="text")?.text||"{}";
-      const clean = text.replace(/```json|```/g,"").trim();
-      const json  = JSON.parse(clean.match(/\{[\s\S]*\}/)?.[0]||"{}");
+      const clean   = text.replace(/```json|```/g,"").trim();
+      const jsonStr = clean.match(/\{[\s\S]*\}/)?.[0] || "{}";
+      let json = { flags:[], resumo_geral:"" };
+      try {
+        json = JSON.parse(jsonStr);
+      } catch {
+        // JSON truncado — recupera flags parciais
+        const flagsMatch = jsonStr.match(/"flags"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+        const resumoMatch = jsonStr.match(/"resumo_geral"\s*:\s*"([^"]*)"/);
+        const items = [];
+        if (flagsMatch?.[1]) {
+          const re = /\{[^{}]*(?:"[^"]*"[^{}]*)*\}/g;
+          let m;
+          while ((m = re.exec(flagsMatch[1])) !== null) {
+            try { items.push(JSON.parse(m[0])); } catch {}
+          }
+        }
+        json.flags = items;
+        json.resumo_geral = (resumoMatch?.[1] || "") + (items.length ? " (resposta parcialmente recuperada)" : "");
+      }
       setVerificacaoGeral(json);
     } catch(e) {
       setVerificacaoGeral({flags:[],resumo_geral:`Erro: ${e.message}`});
@@ -594,7 +612,28 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       const resp = await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
       const data = await resp.json();
       const text = data.content?.find(b=>b.type==="text")?.text||"{}";
-      const json = JSON.parse(text.replace(/```json|```/g,"").trim().match(/\{[\s\S]*\}/)?.[0]||"{}");
+      const clean = text.replace(/```json|```/g,"").trim();
+      const jsonStr = clean.match(/\{[\s\S]*\}/)?.[0] || "{}";
+      let json = { correcoes:[], licoes:[] };
+      try {
+        json = JSON.parse(jsonStr);
+      } catch {
+        // JSON truncado — recupera arrays parciais válidos
+        const corrMatch = jsonStr.match(/"correcoes"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+        const licMatch  = jsonStr.match(/"licoes"\s*:\s*\[([\s\S]*?)(?:\]|$)/);
+        const parseArr  = str => {
+          if (!str) return [];
+          const items = [];
+          const re = /\{[^{}]*(?:"[^"]*"[^{}]*)*\}/g;
+          let m;
+          while ((m = re.exec(str)) !== null) {
+            try { items.push(JSON.parse(m[0])); } catch {}
+          }
+          return items;
+        };
+        json.correcoes = parseArr(corrMatch?.[1]);
+        json.licoes    = parseArr(licMatch?.[1]);
+      }
       setCorrecoes(json);
     } catch(e) {
       setCorrecoes({ correcoes:[], licoes:[], erro: e.message });
