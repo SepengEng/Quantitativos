@@ -1,13 +1,36 @@
+const MODELOS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-flash-lite-latest",
+];
+
 async function chamarGemini(geminiBody, apiKey) {
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(geminiBody),
+  for (const modelo of MODELOS) {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(geminiBody),
+      }
+    );
+    const data = await response.json();
+
+    if (data.error?.code === 429) {
+      // Rate limit neste modelo — tenta o próximo
+      console.log(`[Gemini] ${modelo} rate limited, tentando próximo...`);
+      continue;
     }
-  );
-  return response.json();
+
+    console.log(`[Gemini] modelo usado: ${modelo}, finishReason: ${data.candidates?.[0]?.finishReason}`);
+    return data;
+  }
+
+  // Todos os modelos esgotados — retorna rate_limit para o cliente esperar e retentar
+  const msg = data?.error?.message || "Todos os modelos Gemini atingiram o rate limit";
+  const retryMatch = (msg || "").match(/retry.*?(\d+(?:\.\d+)?)s/i);
+  const retryAfter = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 20;
+  return { error: { code: 429, type: "rate_limit", message: msg, retryAfter } };
 }
 
 export async function POST(request) {
@@ -46,22 +69,21 @@ export async function POST(request) {
   const data = await chamarGemini(geminiBody, apiKey);
 
   if (data.error) {
-    const isRateLimit = data.error.code === 429;
-    const msg = data.error.message || "";
-    const retryMatch = msg.match(/retry.*?(\d+(?:\.\d+)?)s/i);
-    const retryAfter = isRateLimit ? (retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 20) : null;
+    const isRateLimit = data.error.code === 429 || data.error.type === "rate_limit";
     return Response.json({
       type: "error",
-      error: { type: isRateLimit ? "rate_limit" : "gemini_error", message: msg, retryAfter }
+      error: {
+        type: isRateLimit ? "rate_limit" : "gemini_error",
+        message: data.error.message,
+        retryAfter: data.error.retryAfter || null,
+      }
     });
   }
 
-  // Gemini 2.5 Flash tem "thinking parts" — pega só o texto real (sem thought:true)
+  // Gemini 2.5 tem "thinking parts" — pega só o texto real
   const respParts = data.candidates?.[0]?.content?.parts || [];
   const textPart = respParts.find(p => p.text && !p.thought) || respParts.find(p => p.text);
   const text = textPart?.text || "{}";
-
-  console.log("[Gemini] finishReason:", data.candidates?.[0]?.finishReason);
 
   return Response.json({ content: [{ type: "text", text }] });
 }
