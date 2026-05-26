@@ -57,21 +57,45 @@ const PREFIXOS = {
   "CFT":"CFTV","CAM":"CFTV","VOZ":"Dados e Voz","DAD":"Dados e Voz",
   "SPD":"SPDA","GAS":"Gás Industrial","TUB":"Gás Industrial","MEC":"Mecânica",
 };
-// Padrões BYD — busca em qualquer posição do nome (ex: DW-..._AC2-, DW-..._WS6-)
-const PREFIXOS_INLINE = {
-  "_AC":"Arquitetura",    "_WS":"Hidrossanitária",
-  "_ST":"Estrutura",      "_PS":"Elétrica",
-  "_HS":"HVAC",           "_FP":"Incêndio",
-  "_MS":"Especificação",  "_BD":"Elétrica",
-  "-AC":"Arquitetura",    "-WS":"Hidrossanitária",
-  "-ST":"Estrutura",      "-PS":"Elétrica",
+// BYD: mapa de códigos de disciplina conforme NI-PH00.00.GE/ED.GE0-001
+const BYD_DISC = {
+  "AC":"Arquitetura",   // Architecture
+  "UR":"Arquitetura",   // Urbanization
+  "PR":"Arquitetura",   // Preliminary Services
+  "EM":"Arquitetura",   // Earthmove
+  "IM":"Arquitetura",   // Waterproofing
+  "RS":"Arquitetura",   // Road System
+  "ST":"Estrutura",     // Steel Structure
+  "CE":"Estrutura",     // Concrete Structure
+  "FD":"Estrutura",     // Foundation
+  "SR":"Estrutura",     // Soil Retaining Structures
+  "DN":"Pluvial",       // Drainage
+  "WS":"Hidrossanitária", // Water Supply & Sewage
+  "IE":"Hidrossanitária", // Industrial Efluents
+  "PS":"Elétrica",      // Power Supply
+  "HM":"Elétrica",      // High/Medium Voltage
+  "LV":"Elétrica",      // Low Voltage
+  "EL":"Elétrica",      // Electric (Dormitory)
+  "HV":"HVAC",          // HVAC
+  "AS":"HVAC",          // Auxiliary Systems (AC/compressed air/LPG)
+  "FS":"Incêndio",      // Firefighting System
+  "GP":"SPDA",          // General Protection (grounding/lightning)
+  "TL":"Dados e Voz",   // Telecommunication
+  "GA":"Gás Industrial",// Gas (Dormitory)
+  "PP":"Gás Industrial",// Piping
+  "IA":"Especificação", // Instrumentation & Automation
+  "EQ":"Especificação", // Equipment
+  "PC":"Especificação", // Process
+  "IR":"Hidrossanitária",// Irrigation
 };
 function detectarDisciplina(fileName) {
   if (!fileName) return null;
   const u = fileName.toUpperCase();
-  // Checar padrões inline (BYD e outros com código interno no nome)
-  for (const [p,d] of Object.entries(PREFIXOS_INLINE)) {
-    if (u.includes(p)) return d;
+  // BYD: padrão ED.XX# ou BD.XX# ou LD.XX# (ex: _ED.ST1, _ED.AC2)
+  const bydMatch = u.match(/(?:ED|BD|LD)\.([A-Z]{2,3})\d/);
+  if (bydMatch) {
+    const d = BYD_DISC[bydMatch[1]];
+    if (d) return d;
   }
   // Checar prefixos padrão (início do nome ou entre separadores)
   for (const [p,d] of Object.entries(PREFIXOS)) {
@@ -427,12 +451,17 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       setPendentes(p=>[...p,{id,fileName:file.name,disciplina:disc,imgs:null,status:"carregando",progresso:"Lendo arquivo..."}]);
       try{
         let imgs=[];
+        let progDesc="";
         if(file.type==="application/pdf"){
-          imgs=await pdfParaImagens(file);
+          // Envia PDF diretamente ao Gemini (suporte nativo — preserva qualidade de CAD/DWG)
+          const base64=await toB64(file);
+          imgs=[{base64,type:"application/pdf"}];
+          progDesc="PDF completo";
         } else if(file.type.startsWith("image/")){
           imgs=[{base64:await toB64(file),type:file.type}];
+          progDesc=`${imgs.length} pág.`;
         } else { setPendentes(p=>p.filter(x=>x.id!==id)); continue; }
-        setPendentes(p=>p.map(x=>x.id===id?{...x,imgs,status:"pronto",progresso:`${imgs.length} pág. · ${disc||"disciplina a detectar"}`}:x));
+        setPendentes(p=>p.map(x=>x.id===id?{...x,imgs,status:"pronto",progresso:`${progDesc} · ${disc||"disciplina a detectar"}`}:x));
         novos.push(id);
       } catch(e){
         setPendentes(p=>p.map(x=>x.id===id?{...x,status:"erro",progresso:"Erro ao ler: "+e.message}:x));
@@ -446,18 +475,27 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
     if(!prontas.length)return;
     setOrcando(true);setErro("");
 
-    for(const pend of prontas){
+    for(let pi=0;pi<prontas.length;pi++){
+      const pend=prontas[pi];
+      // Delay de 4s entre plantas (exceto a primeira) para respeitar rate limit do Gemini free
+      if(pi>0) await new Promise(r=>setTimeout(r,4000));
       setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"analisando",progresso:"IA analisando..."}:x));
       try{
         const prompt=getPrompt(pend.disciplina);
         const todosItens=[];let ultimoParsed=null;
+        const isPDF=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
         for(let i=0;i<pend.imgs.length;i++){
-          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`}:x));
+          // Delay de 4s entre páginas para respeitar limite free do Gemini (20 req/min)
+          if(i>0) await new Promise(r=>setTimeout(r,4000));
+          const pgMsg=isPDF?`IA lendo PDF completo${pend.disciplina?` · ${pend.disciplina}`:""}...`:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
           const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:4096,system:prompt,
+            body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?8192:4096,system:prompt,
               messages:[{role:"user",content:[
                 {type:"image",source:{type:"base64",media_type:pend.imgs[i].type,data:pend.imgs[i].base64}},
-                {type:"text",text:`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}` }
+                {type:"text",text:isPDF
+                  ?`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos de TODAS as pranchas e retorne um único JSON consolidado.`
+                  :`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}`}
               ]}]
             })
           });
@@ -502,14 +540,18 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           analisadoEm:new Date().toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}),
         };
         atualizar(o=>({...o,plantas:[...(o.plantas||[]),novaPlanta]}));
-        setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"concluido",progresso:`✅ ${itensEnriquecidos.length} itens · ${fmtR(itensEnriquecidos.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0))}`}:x));
+        const totalValor=itensEnriquecidos.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
+        const progMsg=itensEnriquecidos.length===0
+          ?`⚠️ 0 itens — IA respondeu: "${(ultimoParsed?.resumo||ultimoParsed?.disciplina||"sem resumo").slice(0,100)}"`
+          :`✅ ${itensEnriquecidos.length} itens · ${fmtR(totalValor)}`;
+        setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"concluido",progresso:progMsg}:x));
       } catch(e){
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"erro",progresso:"Erro: "+e.message}:x));
       }
     }
     setOrcando(false);
-    // Limpar as concluídas após 3s
-    setTimeout(()=>setPendentes(p=>p.filter(x=>x.status!=="concluido"&&x.status!=="erro")),3000);
+    // Limpar as concluídas após 15s (tempo para ler debug de 0 itens)
+    setTimeout(()=>setPendentes(p=>p.filter(x=>x.status!=="concluido"&&x.status!=="erro")),15000);
   };
 
   const removerPendente=(id)=>setPendentes(p=>p.filter(x=>x.id!==id));
@@ -609,9 +651,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
                     <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
                       {p.disciplina&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:col.bg||"#f3f4f6",color:col.text||"#374151",border:`1px solid ${col.border||"#e5e7eb"}`}}>{p.disciplina}</span>}
                       {p.escala&&<span style={{fontSize:11,color:"#9ca3af"}}>escala {p.escala}</span>}
-                      <span style={{fontSize:11,color:"#9ca3af"}}>{nItens} itens · {nPreco} cotados</span>
+                      <span style={{fontSize:11,color:nItens===0?"#dc2626":"#9ca3af"}}>{nItens} itens{nItens>0?` · ${nPreco} cotados`:""}</span>
                       {total>0&&<span style={{fontSize:11,color:"#059669",fontWeight:600}}>{fmtR(total)}</span>}
                     </div>
+                    {nItens===0&&p.resumo&&<div style={{fontSize:11,color:"#6b7280",marginTop:4,fontStyle:"italic"}}>IA: "{p.resumo.slice(0,120)}"</div>}
                   </div>
                   <div style={{display:"flex",gap:8,flexShrink:0}}>
                     <button onClick={e=>{e.stopPropagation();if(confirm("Excluir?"))atualizar(o=>({...o,plantas:o.plantas.filter(x=>x.id!==p.id)}));}} style={{fontSize:12,color:"#dc2626",background:"none",border:"none",cursor:"pointer"}}>✕</button>

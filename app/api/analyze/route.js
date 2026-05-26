@@ -25,7 +25,10 @@ export async function POST(request) {
   const geminiBody = {
     systemInstruction: body.system ? { parts: [{ text: body.system }] } : undefined,
     contents: [{ role: "user", parts }],
-    generationConfig: { maxOutputTokens: body.max_tokens || 4096 },
+    generationConfig: {
+      maxOutputTokens: body.max_tokens || 8192,
+      thinkingConfig: { thinkingBudget: 2048 },
+    },
   };
 
   const response = await fetch(
@@ -44,9 +47,13 @@ export async function POST(request) {
   }
 
   // Gemini 2.5 Flash tem "thinking parts" — pega só o texto real (sem thought:true)
-  const parts = data.candidates?.[0]?.content?.parts || [];
-  const textPart = parts.find(p => p.text && !p.thought) || parts.find(p => p.text);
+  const respParts = data.candidates?.[0]?.content?.parts || [];
+  const textPart = respParts.find(p => p.text && !p.thought) || respParts.find(p => p.text);
   const text = textPart?.text || "{}";
+
+  const finish = data.candidates?.[0]?.finishReason;
+  console.log("[Gemini] finishReason:", finish);
+  console.log("[Gemini] resposta completa:\n", text.slice(0, 2000));
 
   return Response.json({ content: [{ type: "text", text }] });
 }
