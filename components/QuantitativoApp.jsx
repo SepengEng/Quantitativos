@@ -499,10 +499,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           });
           const chamar=()=>fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
           let data=await (await chamar()).json();
-          // Rate limit — espera o tempo sugerido e retenta automaticamente (client-side)
-          if(data.error?.type==="rate_limit"){
-            const espera=(data.error.retryAfter||20)*1000;
-            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Rate limit — aguardando ${Math.round(espera/1000)}s...`}:x));
+          // Rate limit — retenta até 5x esperando o tempo sugerido
+          for(let rt=0;rt<5&&data.error?.type==="rate_limit";rt++){
+            const espera=(data.error.retryAfter||30)*1000;
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/5)...`}:x));
             await new Promise(r=>setTimeout(r,espera));
             data=await (await chamar()).json();
           }
