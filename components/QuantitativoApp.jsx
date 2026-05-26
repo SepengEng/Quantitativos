@@ -232,6 +232,12 @@ function montarObraCtx(obra, plantasExistentes) {
       partes.push(`EXEMPLOS DE ITENS JÁ EXTRAÍDOS NESTA OBRA (use como referência de escala e padrão):\n${exemplos.join("\n")}`);
     }
   }
+  // Lições aprendidas de erros anteriores corrigidos pela IA
+  const licoes = getLicoes();
+  if (licoes.length > 0) {
+    const top = licoes.slice(0, 12).map(l => `  ⚠ ${l.padrao} → ${l.correcao}`).join("\n");
+    partes.push(`ERROS APRENDIDOS — EVITE REPETIR:\n${top}`);
+  }
   return partes.join("\n");
 }
 
@@ -248,6 +254,17 @@ function checaConsistencia(itens, disciplina) {
   if (ratio < 50)  return { tipo: "aviso", ratio, msg: `Ratio aço/concreto = ${ratio.toFixed(0)} kg/m³ — abaixo do esperado (80–350 kg/m³). Verifique se toda armação foi extraída.` };
   if (ratio > 400) return { tipo: "aviso", ratio, msg: `Ratio aço/concreto = ${ratio.toFixed(0)} kg/m³ — acima do esperado (80–350 kg/m³). Possível duplicação de quantitativo.` };
   return { tipo: "ok", ratio, msg: `Ratio aço/concreto = ${ratio.toFixed(0)} kg/m³ — dentro da faixa esperada (80–350 kg/m³).` };
+}
+
+// ─── LIÇÕES APRENDIDAS (localStorage) ────────────────────────────────────────
+function getLicoes() {
+  try { return JSON.parse(localStorage.getItem("qt_licoes") || "[]"); } catch { return []; }
+}
+function salvarLicoes(novas) {
+  const atuais = getLicoes();
+  const merged = [...novas.map(l => ({ ...l, criadoEm: new Date().toISOString() })), ...atuais];
+  const dedup  = merged.filter((l, i) => !merged.slice(0, i).some(x => x.padrao === l.padrao));
+  localStorage.setItem("qt_licoes", JSON.stringify(dedup.slice(0, 30)));
 }
 
 // Valida compatibilidade de unidade entre item e SINAPI
@@ -521,6 +538,9 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   const [erro,setErro]             = useState("");
   const [verificandoGeral,setVerificandoGeral] = useState(false);
   const [verificacaoGeral,setVerificacaoGeral] = useState(null);
+  const [corrigindo,setCorrigindo]   = useState(false);
+  const [correcoes,setCorrecoes]     = useState(null);  // preview antes de aplicar
+  const [nAplicadas,setNAplicadas]   = useState(0);
   const fileRef = useRef();
   const ultimaRequisicao = useRef(0);
   const cliente = clientes.find(c=>c.id===obra.clienteId);
@@ -551,6 +571,61 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       setVerificacaoGeral({flags:[],resumo_geral:`Erro: ${e.message}`});
     }
     setVerificandoGeral(false);
+  };
+
+  const corrigirComIA = async () => {
+    if (!verificacaoGeral?.flags?.length || corrigindo) return;
+    setCorrigindo(true); setCorrecoes(null);
+    try {
+      const todasPlantas = obraAtual?.plantas || [];
+      // Monta contexto: itens flagados com seus dados atuais
+      const itensFlagados = verificacaoGeral.flags.map(f => {
+        const planta = todasPlantas.find(p => p.fileName === f.planta || p.disciplina === f.planta);
+        const item   = planta?.itens?.find(i => i.codigo_item === f.codigo_item);
+        return { ...f, item_atual: item ? { qtd: item.qtd, un: item.un, sinapi: item.sinapi_sugerido, descricao: item.descricao } : null };
+      });
+
+      const promptCorr = `Você revisou os quantitativos da obra "${obra.nome}" e identificou os seguintes problemas:\n\n${
+        itensFlagados.map(f => `[${f.gravidade}] ${f.planta} / ${f.codigo_item||"?"}: ${f.problema}\n  Dado atual: ${JSON.stringify(f.item_atual)}\n  Sugestão anterior: ${f.sugestao||"—"}`).join("\n\n")
+      }\n\nAgora gere as correções específicas e extraia as lições aprendidas para melhorar análises futuras.\n\nRetorne APENAS JSON:\n{"correcoes":[{"planta":"nome do arquivo exato","codigo_item":"XXX-001","campo":"qtd|sinapi_sugerido|un|descricao","valor_atual":"...","valor_novo":"...","justificativa":"por que corrigir"}],"licoes":[{"padrao":"padrão de erro a evitar nas próximas análises","correcao":"como extrair corretamente"}]}`;
+
+      const reqBody = JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:8192,
+        system: promptCorr, messages:[{role:"user",content:[{type:"text",text:"Gere as correções e lições aprendidas."}]}] });
+      const resp = await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
+      const data = await resp.json();
+      const text = data.content?.find(b=>b.type==="text")?.text||"{}";
+      const json = JSON.parse(text.replace(/```json|```/g,"").trim().match(/\{[\s\S]*\}/)?.[0]||"{}");
+      setCorrecoes(json);
+    } catch(e) {
+      setCorrecoes({ correcoes:[], licoes:[], erro: e.message });
+    }
+    setCorrigindo(false);
+  };
+
+  const aplicarCorrecoes = () => {
+    if (!correcoes?.correcoes?.length) return;
+    const todasPlantas = obraAtual?.plantas || [];
+    let count = 0;
+    atualizar(o => ({
+      ...o,
+      plantas: o.plantas.map(planta => {
+        const corrsPlanta = correcoes.correcoes.filter(c => c.planta === planta.fileName);
+        if (!corrsPlanta.length) return planta;
+        return {
+          ...planta,
+          itens: planta.itens.map(item => {
+            const corr = corrsPlanta.find(c => c.codigo_item === item.codigo_item);
+            if (!corr) return item;
+            count++;
+            return { ...item, [corr.campo]: corr.valor_novo, corrigido_ia: true, corr_justificativa: corr.justificativa };
+          }),
+        };
+      }),
+    }));
+    if (correcoes.licoes?.length) salvarLicoes(correcoes.licoes);
+    setNAplicadas(count);
+    setCorrecoes(null);
+    setVerificacaoGeral(null);
   };
 
   const pdfParaImagens = (file)=>new Promise((resolve,reject)=>{
@@ -792,7 +867,14 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         <div style={{...S.card,padding:16,marginBottom:16,border:"1px solid #bae6fd",background:"#f0f9ff"}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
             <div style={{fontSize:13,fontWeight:700,color:"#0369a1"}}>🔍 Verificação IA — {verificacaoGeral.flags?.length||0} flag{verificacaoGeral.flags?.length!==1?"s":""} encontrada{verificacaoGeral.flags?.length!==1?"s":""}</div>
-            <button onClick={()=>setVerificacaoGeral(null)} style={{fontSize:12,color:"#9ca3af",background:"none",border:"none",cursor:"pointer"}}>✕</button>
+            <div style={{display:"flex",gap:8}}>
+              {(verificacaoGeral.flags||[]).length>0&&(
+                <button onClick={corrigirComIA} disabled={corrigindo} style={{...S.btnPrimary,fontSize:12,padding:"5px 12px",opacity:corrigindo?0.7:1}}>
+                  {corrigindo?"⏳ Gerando correções...":"🔧 Corrigir com IA"}
+                </button>
+              )}
+              <button onClick={()=>{setVerificacaoGeral(null);setCorrecoes(null);}} style={{fontSize:12,color:"#9ca3af",background:"none",border:"none",cursor:"pointer"}}>✕</button>
+            </div>
           </div>
           {verificacaoGeral.resumo_geral&&<div style={{fontSize:12,color:"#0c4a6e",marginBottom:10,padding:"8px 12px",background:"#e0f2fe",borderRadius:8}}>{verificacaoGeral.resumo_geral}</div>}
           {(verificacaoGeral.flags||[]).length>0&&(
@@ -809,6 +891,47 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {/* Preview de correções propostas pela IA */}
+      {correcoes&&(
+        <div style={{...S.card,padding:16,marginBottom:16,border:"1px solid #bbf7d0",background:"#f0fdf4"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+            <div style={{fontSize:13,fontWeight:700,color:"#166534"}}>🔧 Correções propostas — {correcoes.correcoes?.length||0} item{correcoes.correcoes?.length!==1?"s":""}</div>
+            <button onClick={()=>setCorrecoes(null)} style={{fontSize:12,color:"#9ca3af",background:"none",border:"none",cursor:"pointer"}}>✕</button>
+          </div>
+          {correcoes.erro&&<div style={{fontSize:12,color:"#dc2626",marginBottom:8}}>{correcoes.erro}</div>}
+          {(correcoes.correcoes||[]).map((c,k)=>(
+            <div key={k} style={{padding:"8px 10px",borderRadius:8,background:"#fff",border:"1px solid #bbf7d0",marginBottom:6}}>
+              <div style={{fontSize:11,color:"#6b7280",marginBottom:3}}>{c.planta} <span style={{fontFamily:"monospace",color:"#059669"}}>· {c.codigo_item}</span> — campo: <strong>{c.campo}</strong></div>
+              <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                <span style={{fontSize:12,color:"#dc2626",textDecoration:"line-through"}}>{String(c.valor_atual)}</span>
+                <span style={{fontSize:12,color:"#6b7280"}}>→</span>
+                <span style={{fontSize:12,fontWeight:700,color:"#059669"}}>{String(c.valor_novo)}</span>
+              </div>
+              <div style={{fontSize:11,color:"#6b7280",marginTop:3,fontStyle:"italic"}}>{c.justificativa}</div>
+            </div>
+          ))}
+          {(correcoes.licoes||[]).length>0&&(
+            <div style={{marginTop:10,padding:"8px 10px",background:"#dcfce7",borderRadius:8}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#166534",marginBottom:4}}>📚 {correcoes.licoes.length} lição{correcoes.licoes.length!==1?"":"s"} aprendida{correcoes.licoes.length!==1?"s":""} — será salva e aplicada nas próximas análises</div>
+              {correcoes.licoes.map((l,k)=><div key={k} style={{fontSize:11,color:"#166534",marginBottom:2}}>⚠ {l.padrao} → {l.correcao}</div>)}
+            </div>
+          )}
+          {(correcoes.correcoes||[]).length>0&&(
+            <button onClick={aplicarCorrecoes} style={{...S.btnPrimary,marginTop:12,background:"#059669",fontSize:13,padding:"8px 18px"}}>
+              ✓ Aplicar {correcoes.correcoes.length} correçõ{correcoes.correcoes.length===1?"":"es"} e salvar lições
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Confirmação de aplicação */}
+      {nAplicadas>0&&(
+        <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:"#166534",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          ✓ {nAplicadas} item{nAplicadas!==1?"s":""} corrigido{nAplicadas!==1?"s":""} pela IA. Lições salvas para as próximas análises.
+          <button onClick={()=>setNAplicadas(0)} style={{fontSize:12,color:"#6b7280",background:"none",border:"none",cursor:"pointer"}}>✕</button>
         </div>
       )}
 
@@ -896,6 +1019,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
                       {total>0&&<span style={{fontSize:11,color:"#059669",fontWeight:600}}>{fmtR(total)}</span>}
                       {p.consistencia?.tipo==="aviso"&&<span style={{fontSize:11,color:"#b45309",background:"#fef3c7",padding:"1px 7px",borderRadius:20,border:"1px solid #fcd34d"}} title={p.consistencia.msg}>⚠ aço/concreto</span>}
                       {p.consistencia?.tipo==="ok"&&<span style={{fontSize:11,color:"#065f46",background:"#d1fae5",padding:"1px 7px",borderRadius:20,border:"1px solid #6ee7b7"}} title={p.consistencia.msg}>✓ estrutura ok</span>}
+                      {(p.itens||[]).filter(i=>i.corrigido_ia).length>0&&<span style={{fontSize:11,color:"#059669",background:"#f0fdf4",padding:"1px 7px",borderRadius:20,border:"1px solid #bbf7d0"}}>🔧 {(p.itens||[]).filter(i=>i.corrigido_ia).length} corrigido{(p.itens||[]).filter(i=>i.corrigido_ia).length!==1?"s":""}</span>}
                     </div>
                     {nItens===0&&p.resumo&&<div style={{fontSize:11,color:"#6b7280",marginTop:4,fontStyle:"italic"}}>IA: "{p.resumo.slice(0,120)}"</div>}
                   </div>
