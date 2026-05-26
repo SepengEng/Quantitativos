@@ -61,7 +61,12 @@ export async function POST(request) {
     const content = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
     for (const block of content) {
       if (block.type === "image") {
-        parts.push({ inline_data: { mime_type: block.source.media_type, data: block.source.data } });
+        if (block.source.fileUri) {
+          // Arquivo grande carregado via Gemini File API
+          parts.push({ file_data: { mime_type: block.source.media_type, file_uri: block.source.fileUri } });
+        } else {
+          parts.push({ inline_data: { mime_type: block.source.media_type, data: block.source.data } });
+        }
       } else if (block.type === "text") {
         parts.push({ text: block.text });
       }

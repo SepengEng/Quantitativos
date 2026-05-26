@@ -49,6 +49,43 @@ async function resolverPrecosBatch(itens) {
   return resultado;
 }
 
+// ─── UPLOAD DIRETO PARA GEMINI FILE API (contorna limite 4,5 MB do Vercel) ───
+// PDFs grandes são enviados direto para o Google; o servidor recebe só a URI.
+async function uploadParaGeminiFileAPI(file, onStatus) {
+  const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+  if (!apiKey) throw new Error("NEXT_PUBLIC_GEMINI_API_KEY não configurada");
+
+  onStatus?.(`Enviando ${(file.size/1024/1024).toFixed(1)} MB para Gemini...`);
+
+  const form = new FormData();
+  form.append("file", file, file.name);
+
+  const resp = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
+    { method: "POST", body: form }
+  );
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(`Upload Gemini: ${err.error?.message || resp.status}`);
+  }
+  const data = await resp.json();
+  const fileUri  = data.file?.uri;
+  const fileName = data.file?.name; // "files/abc123"
+  if (!fileUri) throw new Error("Gemini não retornou URI do arquivo");
+
+  // Aguarda estado ACTIVE (PDFs ficam ativos quase imediatamente)
+  for (let i = 0; i < 8; i++) {
+    const st = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`
+    ).then(r => r.json()).catch(() => ({}));
+    if (!st.state || st.state === "ACTIVE") break;
+    onStatus?.(`Processando arquivo... (${i+1}/8)`);
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  return { fileUri, mimeType: data.file?.mimeType || file.type };
+}
+
 // ─── DETECÇÃO DE DISCIPLINA ───────────────────────────────────────────────────
 const PREFIXOS = {
   "ARQ":"Arquitetura","EST":"Estrutura","ELE":"Elétrica",
@@ -454,12 +491,20 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         let imgs=[];
         let progDesc="";
         if(file.type==="application/pdf"){
-          // Envia PDF diretamente ao Gemini (suporte nativo — preserva qualidade de CAD/DWG)
-          const base64=await toB64(file);
           const tamanhoMB=(file.size/1024/1024).toFixed(1);
-          imgs=[{base64,type:"application/pdf"}];
-          // Base64 aumenta ~33% — avisa se próximo do limite de 4,5 MB do Vercel
-          progDesc=file.size>3_000_000?`PDF completo · ⚠️ ${tamanhoMB} MB (grande)`:`PDF completo · ${tamanhoMB} MB`;
+          if(file.size > 3_000_000){
+            // PDF grande: upload direto para Gemini File API (contorna limite 4,5 MB Vercel)
+            const {fileUri, mimeType} = await uploadParaGeminiFileAPI(file,
+              (msg) => setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
+            );
+            imgs=[{fileUri, type:mimeType}];
+            progDesc=`PDF completo · ${tamanhoMB} MB (via File API)`;
+          } else {
+            // PDF pequeno: base64 inline (mais rápido, sem roundtrip extra)
+            const base64=await toB64(file);
+            imgs=[{base64,type:"application/pdf"}];
+            progDesc=`PDF completo · ${tamanhoMB} MB`;
+          }
         } else if(file.type.startsWith("image/")){
           imgs=[{base64:await toB64(file),type:file.type}];
           progDesc=`${imgs.length} pág.`;
@@ -492,9 +537,13 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           if(i>0) await new Promise(r=>setTimeout(r,4000));
           const pgMsg=isPDF?`IA lendo PDF completo${pend.disciplina?` · ${pend.disciplina}`:""}...`:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
           setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
+          const img=pend.imgs[i];
+          const imgSource=img.fileUri
+            ?{type:"file",  media_type:img.type, fileUri:img.fileUri}
+            :{type:"base64",media_type:img.type, data:img.base64};
           const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?65536:32768,system:prompt,
             messages:[{role:"user",content:[
-              {type:"image",source:{type:"base64",media_type:pend.imgs[i].type,data:pend.imgs[i].base64}},
+              {type:"image",source:imgSource},
               {type:"text",text:isPDF
                 ?`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos de TODAS as pranchas e retorne um único JSON consolidado.`
                 :`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}`}
