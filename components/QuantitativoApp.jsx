@@ -780,30 +780,6 @@ function VisualizadorPlanta({planta,obra,onBack}) {
   const cobertura   = itens.length?Math.round((comPreco.length/itens.length)*100):0;
   const col         = DISC_COR[planta.disciplina]||{};
 
-  const exportarExcel = async (obraAlvo) => {
-    if (!obraAlvo || exportando) return;
-    setExportando(true);
-    try {
-      const resp = await fetch("/api/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ obra: obraAlvo, bdi }),
-      });
-      if (!resp.ok) throw new Error(`Erro HTTP ${resp.status}`);
-      const blob = await resp.blob();
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement("a");
-      a.href     = url;
-      a.download = `ORC_${(obraAlvo.nome||"Obra").replace(/[^a-zA-Z0-9]/g,"_").slice(0,30)}_BDI${bdi}.xlsx`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch(e) {
-      alert("Erro ao exportar: " + e.message);
-    } finally {
-      setExportando(false);
-    }
-  };
-
     const exportar=()=>{
     const rows=["\uFEFFCódigo,Descrição,Un.,Qtd.,Fonte,SINAPI,Preço Unit.,Subtotal,c/BDI,Obs."];
     filtrados.forEach(it=>{const sub=(it.preco_sinapi||0)*(it.qtd||0);rows.push(`"${it.codigo_item}","${it.descricao}","${it.un}","${it.qtd}","${it.fonte}","${it.sinapi_sugerido||""}","${it.preco_sinapi||""}","${sub.toFixed(2)}","${(sub*(1+bdi/100)).toFixed(2)}","${it.obs||""}"`);});
@@ -965,6 +941,30 @@ function SecaoOrcamento({obras}) {
   const [plantaId,setPlantaId]   = useState("");
   const [bdi,setBdi]             = useState(25);
   const [exportando,setExportando] = useState(false);
+
+  const exportarExcel = async (obraAlvo) => {
+    if (!obraAlvo || exportando) return;
+    setExportando(true);
+    try {
+      const resp = await fetch("/api/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ obra: obraAlvo, bdi }),
+      });
+      if (!resp.ok) throw new Error(`Erro HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `ORC_${(obraAlvo.nome||"Obra").replace(/[^a-zA-Z0-9]/g,"_").slice(0,30)}_BDI${bdi}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch(e) {
+      alert("Erro ao exportar: " + e.message);
+    } finally {
+      setExportando(false);
+    }
+  };
 
   const obra   = obras.find(o=>o.id===obraId);
   const planta = obra?.plantas?.find(p=>p.id===plantaId);
