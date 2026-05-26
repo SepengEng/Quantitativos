@@ -1,4 +1,4 @@
-async function chamarGemini(geminiBody, apiKey, tentativa = 0) {
+async function chamarGemini(geminiBody, apiKey) {
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
     {
@@ -7,20 +7,7 @@ async function chamarGemini(geminiBody, apiKey, tentativa = 0) {
       body: JSON.stringify(geminiBody),
     }
   );
-
-  const data = await response.json();
-
-  // Rate limit (429) — espera o tempo sugerido e retenta até 3x
-  if (data.error?.code === 429 && tentativa < 3) {
-    const msg = data.error.message || "";
-    const retryMatch = msg.match(/retry.*?(\d+(?:\.\d+)?)s/i);
-    const espera = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 20;
-    console.log(`[Gemini] rate limit — aguardando ${espera}s (tentativa ${tentativa + 1}/3)`);
-    await new Promise(r => setTimeout(r, espera * 1000));
-    return chamarGemini(geminiBody, apiKey, tentativa + 1);
-  }
-
-  return data;
+  return response.json();
 }
 
 export async function POST(request) {
@@ -59,7 +46,14 @@ export async function POST(request) {
   const data = await chamarGemini(geminiBody, apiKey);
 
   if (data.error) {
-    return Response.json({ type: "error", error: { type: "gemini_error", message: data.error.message } });
+    const isRateLimit = data.error.code === 429;
+    const msg = data.error.message || "";
+    const retryMatch = msg.match(/retry.*?(\d+(?:\.\d+)?)s/i);
+    const retryAfter = isRateLimit ? (retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 20) : null;
+    return Response.json({
+      type: "error",
+      error: { type: isRateLimit ? "rate_limit" : "gemini_error", message: msg, retryAfter }
+    });
   }
 
   // Gemini 2.5 Flash tem "thinking parts" — pega só o texto real (sem thought:true)

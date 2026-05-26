@@ -489,20 +489,25 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           if(i>0) await new Promise(r=>setTimeout(r,4000));
           const pgMsg=isPDF?`IA lendo PDF completo${pend.disciplina?` · ${pend.disciplina}`:""}...`:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
           setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
-          const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},
-            body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?8192:4096,system:prompt,
-              messages:[{role:"user",content:[
-                {type:"image",source:{type:"base64",media_type:pend.imgs[i].type,data:pend.imgs[i].base64}},
-                {type:"text",text:isPDF
-                  ?`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos de TODAS as pranchas e retorne um único JSON consolidado.`
-                  :`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}`}
-              ]}]
-            })
+          const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?8192:4096,system:prompt,
+            messages:[{role:"user",content:[
+              {type:"image",source:{type:"base64",media_type:pend.imgs[i].type,data:pend.imgs[i].base64}},
+              {type:"text",text:isPDF
+                ?`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos de TODAS as pranchas e retorne um único JSON consolidado.`
+                :`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}`}
+            ]}]
           });
-          const data=await resp.json();
-          // Detectar erros da API do Claude (chave, modelo, rate limit, etc.)
+          const chamar=()=>fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
+          let data=await (await chamar()).json();
+          // Rate limit — espera o tempo sugerido e retenta automaticamente (client-side)
+          if(data.error?.type==="rate_limit"){
+            const espera=(data.error.retryAfter||20)*1000;
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Rate limit — aguardando ${Math.round(espera/1000)}s...`}:x));
+            await new Promise(r=>setTimeout(r,espera));
+            data=await (await chamar()).json();
+          }
           if(data.error){
-            throw new Error(`Claude API: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
+            throw new Error(`Gemini API: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
           }
           if(!data.content){
             throw new Error(`Resposta inesperada da API: ${JSON.stringify(data).slice(0,200)}`);
