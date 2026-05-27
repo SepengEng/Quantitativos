@@ -110,7 +110,7 @@ const BYD_DISC = {
   "EM":"Arquitetura",   // Earthmove
   "IM":"Arquitetura",   // Waterproofing
   "RS":"Arquitetura",   // Road System
-  "ST":"Estrutura",     // Steel Structure
+  "ST":"EstruturaMet",  // Steel Structure (scope: another company)
   "CE":"Estrutura",     // Concrete Structure
   "FD":"Estrutura",     // Foundation
   "SR":"Estrutura",     // Soil Retaining Structures
@@ -149,22 +149,59 @@ function detectarDisciplina(fileName) {
   return null;
 }
 
+// Detecta tipo de prancha pelo nome do arquivo para injetar aviso no prompt
+function detectarTipoPrancha(fileName) {
+  if (!fileName) return null;
+  const u = fileName.toUpperCase();
+  // Prefixo CM = Memória de Cálculo (calculation memory) — não extraia quantidades
+  if (u.startsWith("CM-") || u.includes("/CM-") || u.includes("_CM-")) return "memoria_calculo";
+  // Arquivo com "DETALHE" no nome
+  if (u.includes("DETALHE") || u.includes("DETAIL") || u.includes("-DET")) return "detalhe";
+  // Arquivo com "ISO" no nome
+  if (u.includes("ISO") || u.includes("ISOMETRIC")) return "isometrico";
+  return null;
+}
+
+function avisoTipoPrancha(fileName) {
+  const tipo = detectarTipoPrancha(fileName);
+  if (!tipo) return "";
+  if (tipo === "memoria_calculo") return "\n⚠️ ESTE DOCUMENTO É UMA MEMÓRIA DE CÁLCULO — Não extraia quantidades daqui. Use apenas para confirmar especificações técnicas de equipamentos (potência, modelo, parâmetros). As quantidades vêm da planta de layout correspondente.\n";
+  if (tipo === "detalhe") return "\n⚠️ ESTA PRANCHA É DE DETALHE CONSTRUTIVO — Não extraia quantidades. Mostra COMO executar um elemento típico, não QUANTOS existem. Os elementos já estão contabilizados na planta baixa.\n";
+  if (tipo === "isometrico") return "\n⚠️ ESTA PRANCHA É UM ISOMÉTRICO/PERSPECTIVA — Não extraia quantidades. Perspectiva para facilitar execução; quantidades vêm da planta baixa e do corte.\n";
+  return "";
+}
+
 // ─── PROMPTS POR DISCIPLINA ───────────────────────────────────────────────────
 const BASE = `
 INSTRUÇÕES DE ORÇAMENTISTA PROFISSIONAL:
-1. Leia o cabeçalho/título do desenho para entender o que está representado e a escala (ex: 1:50, 1:100, 1:200)
-2. Use TODAS as informações disponíveis: cotas explícitas, tabelas de armação, quadros de esquadrias, legendas, notas técnicas, hachuras e símbolos
-3. Para tabelas de armação/materiais no desenho: extraia diretamente os dados (diâmetro, comprimento, quantidade de barras)
+1. Leia o cabeçalho/título do desenho para identificar: tipo de prancha (planta/corte/detalhe/memória), escala, disciplina e número de revisão
+2. Use TODAS as informações disponíveis: cotas explícitas, tabelas de materiais, quadros de esquadrias, legendas, notas técnicas, hachuras e símbolos
+3. Para tabelas de materiais/armação no desenho: extraia diretamente os dados (dimensões, quantidades, seções)
 4. Quando não houver cota explícita: estime pela escala do desenho, prática construtiva típica ou contexto — e marque como Inferência
 5. NUNCA retorne lista vazia se houver qualquer elemento quantificável visível — extraia o máximo possível
 6. Para cada item, sugira o código SINAPI Bahia Não Desonerado mais preciso
 
+HIERARQUIA DE PRANCHAS — REGRA FUNDAMENTAL:
+Cada conjunto de pranchas de uma disciplina tem TIPOS diferentes. Só extraia quantidades do TIPO correto:
+▶ PLANTA BAIXA (plan view): FONTE PRIMÁRIA — extraia aqui todas as quantidades
+▶ CORTE / ELEVAÇÃO / FACHADA: fonte SECUNDÁRIA — só extraia o que NÃO aparece na planta (ex: alturas de pé-direito)
+▶ DETALHE (detail sheet): NÃO extraia quantidades — mostra COMO construir, não QUANTOS existem. Elementos do detalhe já estão contabilizados na planta
+▶ MEMÓRIA DE CÁLCULO / RELATÓRIO: NÃO extraia quantidades — documento de referência técnica apenas
+▶ ISOMÉTRICO / VISTA 3D: NÃO extraia — perspectiva do que já está na planta
+
 REGRA ANTI-DUPLICAÇÃO — OBRIGATÓRIA:
-- Cada elemento físico deve aparecer UMA ÚNICA VEZ no JSON, independente de quantas vistas o mostrem
-- Se o mesmo elemento aparece em planta baixa E em corte/elevação/detalhe: extraia APENAS da vista com cota mais confiável (cota explícita > escala > inferência)
-- Itens com mesma localização e mesma natureza (ex: "Concreto FCK30 em Pilares - Térreo") NÃO devem se repetir
-- Ao processar PDF com múltiplas pranchas: consolide elementos do mesmo tipo e localização em UM único item com quantidade total
-- Em pranchas de detalhe: os elementos já estão contabilizados na prancha de planta — NÃO some novamente
+- Cada elemento físico deve aparecer UMA ÚNICA VEZ no JSON, independente de quantas pranchas o mostrem
+- Um conjunto de pranchas (ex: CE2-001 + CE2-002 + CE2-003) mostra O MESMO EDIFÍCIO em níveis/vistas diferentes — não some volumes entre elas
+- Planta de cobertura + Planta de piso + Fachadas: todos mostram o mesmo sistema de drenagem — extraia apenas da planta principal
+- Itens com mesma localização e mesma natureza (ex: "Canal de concreto - Perímetro") NÃO devem se repetir
+- Ao processar PDF com múltiplas pranchas: consolide elementos do mesmo tipo em UM único item com quantidade total
+
+REGRAS DE ESCALA — CRÍTICO:
+- Confirme a escala indicada no cabeçalho (ex: 1:50, 1:100, 1:150, 1:200)
+- Dimensões anotadas em cotas já estão em unidade real (geralmente cm ou mm) — não converta pela escala
+- Só use a escala para estimar dimensões SEM cota explícita
+- Identifique a unidade das cotas: projetos BYD/industriais usam MILÍMETROS para dimensões de detalhes e METROS para dimensões gerais
+- Cota "1040" em planta estrutural 1:150 = 10.40m (em cm) — leia como está indicado no título de cotas
 
 Fonte de medição a usar em cada item:
 "📐 Cota" = dimensão lida de cota explícita no desenho
@@ -178,50 +215,209 @@ Regras de confiança: "alta"=cota explícita ou contagem direta; "media"=calcula
 Nota: para itens só-MAT (fornecimento puro) omita mo_sinapi/mo_itens; para itens só-MO omita mat_sinapi/mat_ind.`;
 
 const PROMPTS = {
-"Arquitetura":`Especialista em arquitetura predial. Extraia: PAREDES (m e m² por segmento — alvenaria e drywall separados), PISOS (m² por ambiente e tipo), ESQUADRIAS (tipo, dimensões, contagem), REVESTIMENTOS (m² por tipo), COBERTURA (m² e tipo), LOUÇAS (símbolo a símbolo), SPLITS (BTU anotados).
-SINAPIs: Alv.9cm:87451|14cm:87452|Bl.concreto:89714|Drywall 48mm:90762|73mm:90763|Porcelanato 60x60:87893|Cerâmica parede:87264|Pintura:87880|Reboco:87529|Porta 0,80:88511|Janela correr:88520|Split 18000:88317|Bacia:86896|Lavatório:86897|Telha fibrocimento:88500|Impermeab.manta:88497
+"Arquitetura":`Especialista em arquitetura predial/industrial.
+
+TIPO DE PRANCHA — REGRAS:
+▶ PLANTA BAIXA: extraia paredes, pisos, esquadrias, ambientes — é a fonte de todas as quantidades
+▶ CORTE / ELEVAÇÃO: confirme pé-direito e detalhes de esquadrias — NÃO reextraia paredes já medidas na planta
+▶ DETALHE DE ESQUADRIA: NÃO extraia — esses elementos já foram contados na planta pelo quadro de esquadrias
+
+COMO MEDIR:
+- PAREDES: meça comprimento horizontal total de cada segmento em planta × altura (do piso ao teto) = m² por tipo de alvenaria. Deduza aberturas de portas e janelas. Não some com elevações/fachadas.
+- PISO: área de cada ambiente ou zona em planta (L×C em metros) = m². Não soma piso + forro + paredes como se fossem iguais.
+- ESQUADRIAS: conte cada símbolo no quadro de portas/janelas pelo gabarito: qtd × largura × altura = m² (para alumínio/vidro) ou unidade (para portas).
+- COBERTURA: leia a área em planta de cobertura. Se telha metálica → escopo da estrutura metálica (verifique). Marquises de concreto → inclua.
+- MARQUISE/PLATIBANDA DE CONCRETO: inclua somente se for estrutura de concreto armado (CE), não se for metálica (ST).
+
+PAREDES ESPECIAIS EM ARMAZÉNS/FÁBRICAS:
+- Paredes corta-fogo (firewall) resistência ≥2h: identifique pelo símbolo ou nota — inclua separado como "Alvenaria corta-fogo"
+- Blocos de concreto celular/estrutural são comuns em paredes externas industriais
+- Paredes internas divisórias entre células de armazém = dividas por tipo de alvenaria
+
+SINAPIs: Alv.9cm:87451|14cm:87452|Bl.concreto estrutural:89714|Drywall 48mm:90762|73mm:90763|Porcelanato 60x60:87893|Cerâmica parede:87264|Pintura tinta acrílica:87880|Reboco:87529|Porta aço 0,90:88511|Janela alumínio correr:88520|Split 18000:88317|Bacia:86896|Lavatório:86897|Telha fibrocimento:88500|Impermeab.manta:88497|Concreto polido piso:94992|Piso industrial (epóxi/polido):94992
 ${BASE}`,
-"Estrutura":`Especialista em estruturas concreto/metálica. Extraia: PILARES (seção e qtd), VIGAS (m e seção), LAJES (m² e espessura), CONCRETO (m³=área×esp), FORMAS (m²), ARMAÇÃO (kg=vol×taxa: laje 150/vigas 200/pilares 250 kg/m³), FUNDAÇÕES (tipo, dim, qtd).
-SINAPIs: FCK20:96527|FCK25:96528|FCK30:96529|Forma:94965|CA-50:94966|CA-60:94967|Steel deck:96530|Estrut.metálica:98210|Estaca raiz:74004
+
+"Estrutura":`Especialista em estruturas de concreto armado e fundações (NBR 6118/6122).
+
+TIPO DE PRANCHA — REGRAS CRÍTICAS:
+▶ CE = Concreto Estrutural. Um conjunto de pranchas CE (ex: CE2-001, CE2-002, CE2-003) mostra O MESMO EDIFÍCIO em cortes de nível diferentes (pilares, vigas do 1º pavimento, vigas de cobertura). NÃO some volumes entre pranchas do mesmo conjunto.
+▶ FD = Fundação. Prancha separada das vigas/pilares. Extraia sapatas e vigas de fundação SOMENTE da planta FD.
+▶ DETALHE DE ARMAÇÃO: NÃO extraia volumes — as dimensões da seção transversal do detalhe servem para calcular volume da peça listada na planta.
+
+ESCOPO SEPENG — MUITO IMPORTANTE:
+✅ INCLUIR: Concreto (m³), Formas (m²), Escavação de fundação (m³)
+❌ EXCLUIR SEMPRE: Aço CA-50, CA-60, tela soldada, armadura — esses itens são executados por outra empresa
+
+COMO CALCULAR CONCRETO:
+- PILAR: seção (m²) × altura (m) × quantidade = m³. Altura = diferença entre "Topo da Fundação" e "Topo da Cobertura" na tabela de pavimentos.
+- VIGA: seção (m²) × comprimento total dos vãos (m) = m³. Use a tabela de identificação de vigas para tipo e seção.
+- SAPATA ISOLADA: largura × comprimento × altura (da tabela de dimensionamento) × quantidade = m³
+- VIGA DE FUNDAÇÃO/BALDRAME: seção × comprimento total = m³
+- LAJE: área (m²) × espessura (m) = m³
+
+COMO CALCULAR FORMAS:
+- PILAR: perímetro da seção (m) × altura (m) × quantidade = m²
+- VIGA: (2 × altura + largura) × comprimento = m² (sem descontar apoios)
+- SAPATA: área lateral da sapata = 4 × lado × altura do bloco
+- NÃO inclua formas para peças com seção circular sem forma (ex: estacas)
+
+TABELAS DE DIMENSIONAMENTO (comuns em projetos BYD/industrial):
+- Tabela de pilares: lista KZ1, KZ2, etc. com seção e armação por andar
+- Tabela de fundações: lista J01, J02, etc. com dimensões A1, A2, B1, B2, H1, H2
+- Tabela de pavimentos: lista cotas de piso, topo da fundação e topo da cobertura → calcule alturas reais dos pilares
+
+SINAPIs: Concreto FCK20 bombeado:96527|FCK25:96528|FCK30:96529|FCK35:96532|Forma compensada pilares:94965|Forma compensada vigas:94966|Forma laje:94967|Escavação manual 1,5m:73961|Escavação mecanizada:73964|Brita calçamento:74232|Lastro concreto magro:94990
 ${BASE}`,
-"Elétrica":`Especialista em elétrica predial/industrial (NBR 5410). Extraia: ELETRODUTOS (m por ø e tipo), CABOS (m por seção mm²), TOMADAS/INTERRUPTORES (contar símbolos), LUMINÁRIAS (contar por tipo), QUADROS (QD/QDL — contar), DISJUNTORES (contar por amperagem), BANDEJAS (m por largura).
-SINAPIs: Eletroduto PVC 25mm:91911|32mm:91912|50mm:91913|Metálico 1":91914|Bandeja 100x50:91935|200x50:91936|Cabo 2,5mm²:91925|4mm²:91926|6mm²:91927|10mm²:91928|16mm²:91929|Tomada 20A:91940|LED 40W:91945|Industrial 100W:91946|QD:91950|Disj.bip.20A:91951|Disj.trip.40A:91952
+
+"Elétrica":`Especialista em elétrica predial/industrial (NBR 5410 / NR-10).
+
+TIPO DE PRANCHA — REGRAS:
+▶ PLANTA BAIXA (PS6-001 ou similar): FONTE PRIMÁRIA — extraia aqui luminaires e eletrodutos
+▶ DETALHES DE INSTALAÇÃO (PS6-002 ou similar): NÃO extraia quantidades — mostra método de fixação e componentes de uma instalação típica, não contagem total
+▶ UNIFILARES/DIAGRAMAS: extraia quadros, disjuntores, cargas — não reextraia eletrodutos já medidos na planta
+
+INSTALAÇÕES EM ATMOSFERA EXPLOSIVA (ATEX/HAZARDOUS AREA):
+- Depósitos de resíduos perigosos, refinarias, armazéns de produtos inflamáveis → ZONA 1 ou ZONA 2
+- Eletroduto deve ser AÇO GALVANIZADO (não PVC) com conexões vedadas
+- Luminárias devem ser À PROVA DE EXPLOSÃO (Ex d / Ex e classificação ATEX)
+- Painéis elétricos → também à prova de explosão
+- Os acessórios (uniões vedadas, abrações tipo D, vedadores de rosca) são componentes do eletroduto — inclua separado
+
+COMO MEDIR ELETRODUTOS:
+- Meça comprimento linear pelo trajeto indicado na planta (distância entre pontos de alimentação e luminária/equipamento)
+- Projetos industriais usam principalmente eletroduto rígido metálico (aço galvanizado) — não PVC
+- Anote o diâmetro em polegadas ou mm conforme indicado no desenho
+
+COMO CONTAR LUMINÁRIAS:
+- Conte cada símbolo de luminária na planta — cada símbolo = 1 equipamento
+- Identifique o tipo pelo código (ex: TAL1.M1.3,5,7 = tipo 1, módulo 1, circulitos 3/5/7)
+- Projetos industriais/ATEX usem LED tubular 2×54W ou módulo LED à prova de explosão
+
+SINAPIs: Eletroduto PVC 25mm:91911|32mm:91912|50mm:91913|Eletroduto aço galv.(rígido) 3/4":91914|1":91915|1.1/2":91916|Bandeja 100x50:91935|200x50:91936|Cabo 2,5mm²:91925|4mm²:91926|6mm²:91927|10mm²:91928|16mm²:91929|Tomada 20A:91940|Luminária LED 40W:91945|Luminária industrial 100W (à prova explosão):91946|Quadro elétrico:91950|Disjuntor bip.20A:91951|Disjuntor trip.40A:91952
 ${BASE}`,
+
 "Hidrossanitária":`Especialista em hidrossanitária (NBR 5626/8160). Extraia: ÁGUA FRIA (m por ø), ÁGUA QUENTE (m por ø), ESGOTO (m por ø — ramais/colunas), VENTILAÇÃO (m), REGISTROS/VÁLVULAS (qtd por tipo), RALOS/CAIXAS (contar símbolos), LOUÇAS/METAIS (símbolo a símbolo).
 SINAPIs: Água PVC 25mm:89837|32mm:89838|50mm:89839|75mm:89840|100mm:89841|Esgoto 50mm:89850|75mm:89851|100mm:89852|150mm:89855|Ralo sifonado:89870|Cx sifonada:89871|Cx inspeção:89858|Registro gaveta:89842|Bacia:86896|Lavatório:86897
 ${BASE}`,
-"Pluvial":`Especialista em drenagem pluvial (NBR 10844). Extraia: TUBULAÇÕES (m por ø — registrar i=), PRUMADAS/TQ (contar símbolo a símbolo), RALOS (contar cada), CALHAS (m por largura), CAIXAS INSPEÇÃO (contar por tamanho), CONEXÕES (joelhos/tês pelas direções), BLOCOS ANCORAGEM (1/prumada).
-SINAPIs: PVC SR 75mm:89852|100mm:89853|150mm:89854|Joelho 90°:89855|Tê:89856|Ralo 100mm:89857|Cx inspeção 60x60:89858|Calha galv.:88504|Bloco ancoragem:74010
+
+"Pluvial":`Especialista em drenagem pluvial/águas pluviais (NBR 10844).
+
+TIPO DE PRANCHA — REGRAS CRÍTICAS:
+▶ PLANTA DE COBERTURA (DNS-001): leia áreas de contribuição e posição das descidas — calcule ø das tubulações
+▶ PLANTA DE PISO (DNS-002): FONTE PRINCIPAL — extraia aqui o comprimento das calhas e tubulações no nível do solo
+▶ FACHADAS/CORTES (DNS-003): NÃO extraia — mostram as mesmas calhas do piso em outra vista
+▶ DETALHES (DNS-004): NÃO extraia quantidades — mostram COMO construir a caixa/calha, não quantas existem
+
+COMO MEDIR:
+- CALHAS EM CONCRETO: meça comprimento linear total das calhas no PISO pelo trajeto na planta. A seção vem dos detalhes. NÃO some calha do piso + calha da fachada + calha do detalhe (são a mesma).
+- DESCIDAS/PRUMADAS: conte símbolo a símbolo na planta de cobertura. 1 símbolo = 1 descida (tubo vertical). Comprimento = altura do edifício (aprox 5–7m).
+- CAIXAS COLETORAS DE CONCRETO: conte na planta de piso onde há mudança de direção ou ponto de inspeção
+- TUBULAÇÕES SUBTERRÂNEAS (PEAD): meça comprimento na planta de piso até o ponto de saída para infraestrutura externa. Diâmetro indicado no símbolo (ex: Ø400).
+- POÇOS DE VISITA: conte na planta ou note a existência nos detalhes
+
+ITENS TÍPICOS DRENAGEM INDUSTRIAL:
+- Calha em concreto armado ≥ 300×300mm (dimensões no detalhe) — medir em metros lineares
+- Caixa coletora em concreto (câmara) — medir em unidade
+- Tubo PEAD corrugado (Ø400-600) — medir em metros
+- Grelha metálica sobre calha — medir em metros (igual comprimento da calha)
+- Poço de visita pré-moldado — contar
+
+SINAPIs: Tubo PVC SR 75mm:89852|100mm:89853|150mm:89854|Tubo PEAD 200mm:89860|400mm:89863|Joelho 90° PVC 100mm:89855|Tê PVC:89856|Ralo PVC 100mm:89857|Cx inspeção concreto 60x60:89858|Cx inspeção concreto 100x100:89859|Calha concreto armado:94989|Calha metálica calha:88504|Poço de visita PVC Ø600:73830|Bloco ancoragem:74010
 ${BASE}`,
-"Incêndio":`Especialista em incêndio (NBR 13714/13752/17240). Extraia: SPRINKLERS (contar por tipo: pendant/upright/sidewall), TUB.SPRINKLER (m por ø em aço galv.), HIDRANTES (contar por tipo 1/2/3), TUB.HIDRANTE (m por ø), DETECTORES (contar: fumaça/calor/chama), ACIONADORES MANUAIS (contar), CENTRAL ALARME (contar), ILUM.EMERGÊNCIA (contar), SINALIZAÇÃO (contar placas), EXTINTORES (contar por tipo).
-SINAPIs: Sprinkler pendant:74300|upright:74301|Aço galv.1":74156|1.1/2":74158|2":74159|2.1/2":74160|Hidrante tipo 2:74310|Mangueira 15m:74311|Detector fumaça:74320|Central alarme:74323|Ilum.emergência:91947|Placa sinalização:74330|Extintor CO2:74340|Extintor pó:74341
+
+"Incêndio":`Especialista em sistemas de proteção contra incêndio (NBR 13714/13752/17240/IT CBMBA).
+
+TIPO DE PRANCHA — REGRAS:
+▶ PLANTA BAIXA (FS1-001 ou planta geral): FONTE PRIMÁRIA — conte todos os equipamentos aqui
+▶ ISOMÉTRICO / VISTA ESQUEMÁTICA: NÃO reextraia — perspectiva do que já está na planta
+▶ DETALHE DE ACIONADOR/HIDRANTE: NÃO extraia — mostra o componente, não a quantidade total
+
+COMO CONTAR:
+- SPRINKLERS: conte símbolo a símbolo. Identifique tipo: pendant (pendente, mais comum em teto), upright (em cima), sidewall (parede). Para armazéns industriais com risco alto: sprinkler ESFR ou K≥14 pode ser especificado.
+- HIDRANTES: conte cada símbolo de hidrante (distinção: hidrante de parede = 1 ponto com mangueira; hidrante de coluna = independente)
+- EXTINTORES: conte símbolo a símbolo por tipo (CO2, pó seco, água, espuma, hídrico). Armazéns perigosos usam pó seco e CO2.
+- DETECTORES: conte por tipo — chama (ícone de chama), fumaça (ícone de ponto ou nuvem), calor (H). Para ATEX: detectores à prova de explosão.
+- ACIONADORES MANUAIS: conte em corredores e saídas. Para armazéns: 1 por módulo/célula no mínimo.
+- CENTRAL DE ALARME: 1 por edifício normalmente (contar unidade)
+- TUBULAÇÕES: meça em metros por ø (1", 1.1/2", 2", 2.1/2", 4") — anote material (aço galvanizado Schedule 40)
+
+ATENÇÃO PARA DEPÓSITOS DE RESÍDUOS PERIGOSOS (ATEX):
+- Detectores serão de chama (FLAME DETECTOR) — não fumaça
+- Acionadores manuais à prova de explosão
+- Notificadores A/V (áudio-visual) à prova de explosão
+- Sprinklers podem ser substituídos por sistema deluge/espuma dependendo da classe do resíduo
+
+SINAPIs: Sprinkler pendant:74300|upright:74301|Aço galv.1":74156|1.1/2":74158|2":74159|2.1/2":74160|Hidrante tipo 2:74310|Mangueira 15m:74311|Detector chama:74321|Detector fumaça:74320|Acionador manual:74322|Central alarme:74323|Notificador AV:74324|Extintor CO2 6kg:74340|Extintor pó 6kg:74341|Extintor espuma:74342|Placa sinalização:74330
 ${BASE}`,
+
 "HVAC":`Especialista em climatização (NBR 16401). Extraia: SPLITS/FAN-COILS (contar por BTU/h), DUTOS (m² chapa=comp×perímetro seção), DUTOS FLEXÍVEIS (m linear), DIFUSORES/GRELHAS (contar por tipo), EQUIPAMENTOS (UTA/VRF/chiller — contar), TUB.ÁGUA GELADA (m por ø), ISOLAMENTO DUTOS (m²).
 SINAPIs: Split 9000:88315|12000:88316|18000:88317|24000:88318|Cassete 36000:88319|Duto chapa galv.:88320|Duto flexível:88322|Difusor 300x300:88321|Grelha retorno:88323|Chiller 30TR:88330|Fan-coil:88331|Isolamento duto:88335
 ${BASE}`,
+
 "CFTV":`Especialista em CFTV/segurança. Extraia: CÂMERAS (contar por tipo: dome/bullet/PTZ), CABOS (m por tipo: UTP Cat6/coaxial), ELETRODUTOS (m por ø), DVR/NVR (contar por canais), CATRACAS/TORNIQUETES (contar), LEITORES ACESSO (contar), RACKS (contar).
 SINAPIs: Câmera dome:91960|Câmera bullet:91961|Câmera PTZ:91962|Cabo UTP Cat6:91970|Coaxial RG59:91971|Eletroduto 25mm:91911|32mm:91912|NVR 16ch:91975|Rack 12U:91980|Patch panel:91981
 ${BASE}`,
+
 "Dados e Voz":`Especialista em cabeamento estruturado (NBR 14565). Extraia: PONTOS REDE (contar RJ45 por ambiente), CABOS UTP (m por categoria), ELETRODUTOS (m por ø), BANDEJAS (m por tamanho), PATCH PANELS (contar), SWITCHES (contar), RACKS (contar), FIBRA ÓPTICA (m backbone).
 SINAPIs: Cabo Cat6:91970|Cat6A:91973|Fibra:91972|Eletroduto 25mm:91911|Bandeja 100x50:91935|Patch panel 24p:91981|Switch 24p:91982|Rack 24U:91983|Tomada RJ45:91984
 ${BASE}`,
-"SPDA":`Especialista em SPDA (NBR 5419). Extraia: CAPTORES (tipo e qtd: Franklin/gaiola/ESE), CABOS DESCENDENTES (m), ANEL ATERRAMENTO (m), HASTES (contar), CAIXAS INSPEÇÃO SPDA (contar), DPS (contar por classe I/II/III), CABO MALHA (m cobertura).
-SINAPIs: Haste aterramento:91960|Cabo cobre nu 35mm²:91967|50mm²:91961|70mm²:91968|Cx inspeção SPDA:91962|Captor Franklin:91963|DPS classe II:91965
+
+"SPDA":`Especialista em SPDA e aterramento (NBR 5419 / ABNT NBR IEC 62305).
+
+TIPO DE PRANCHA:
+▶ PLANTA BAIXA: extraia aqui o sistema completo de aterramento e SPDA
+▶ DETALHES: NÃO extraia quantidade — mostra método de instalação de um elemento típico
+
+COMO MEDIR:
+- MALHA DE ATERRAMENTO (strap/fita): meça comprimento total das linhas da malha na planta. Para malha em grelha: some comprimentos nas duas direções. Seção usual: 70×10mm ou 50×10mm em cobre ou aço galvanizado. Unidade: metros lineares.
+- CAPTORES (Franklin/ESE/gaiola): conte os símbolos de captor em cobertura/platibanda. Captores em extremidades e cumeeiras.
+- DESCIDAS (down conductor): conte quantos percursos verticais existem da cobertura até a haste. Altura = altura do edifício.
+- HASTES DE ATERRAMENTO: normalmente 1 a 3 por descida. Comprimento: 2,4m ou 3,0m cada.
+- CAIXAS DE INSPEÇÃO SPDA: 1 por descida a ~0,5m do solo. Contar unidades.
+- DPS (dispositivo proteção surto): nos quadros elétricos — contar por classe (I, II, III). Localização no diagrama unifilar.
+
+EXEMPLO F15 (depósito industrial): Edifício 43,8×18,8m → malha 70×10mm aço: ~(43,8+18,8)×2 = 125m perímetro + malha interna ≈ 200m total. Hastes: ~8 hastes de 3m. Descidas: ~8 descidas.
+
+SINAPIs: Haste aterramento cobre 5/8"×3m:91960|Fita cobre nu 50mm²:91967|Fita cobre nu 70mm²:91968|Cx inspeção SPDA:91962|Captor Franklin:91963|DPS classe II:91965|Eletroduto SPDA:91966
 ${BASE}`,
-"Especificação":`Especialista em especificações técnicas de materiais e equipamentos industriais. 
-Analise o documento e extraia: EQUIPAMENTOS (nome, tag, capacidade/volume, potência), TUBULAÇÕES (material, diâmetro, comprimento estimado), TANQUES/VASOS (volume m³, material, dimensões), BOMBAS (tipo, vazão m³/h, potência kW), INSTRUMENTAÇÃO (manômetros, transmissores, válvulas - contar por símbolo). 
+
+"Especificação":`Especialista em especificações técnicas de materiais e equipamentos industriais.
+
+ATENÇÃO: Documentos de especificação (IA = Instrumentação e Automação, EQ = Equipamentos) descrevem o QUE instalar, não o QUANTO existe. Para quantidades, veja a planta baixa correspondente.
+
+SE FOR PLANTA DE INSTRUMENTAÇÃO (IA):
+- Conte equipamentos pelo TAG: cada TAG único = 1 equipamento (ex: AM-15-0001 = 1 acionador manual)
+- Tipos comuns: AM = acionador manual, JT = notificador A/V, DT = detector, SB = botão supressão
+- Eletrodutos: meça comprimento dos percursos de dutos indicados na planta (em metros lineares)
+- Central de alarme: 1 unidade por edifício
+
 Para itens de processo sem SINAPI, use código da família mais próxima ou deixe sinapi_sugerido vazio.
-SINAPIs: Tubo aço carbono 1":74156|2":74157|4":74159|6":74160|Válvula esfera:74163|Suporte:74165|Bomba centrífuga fornec.:98300
+SINAPIs: Acionador manual:74322|Notificador AV:74324|Detector chama:74321|Central alarme incêndio:74323|Eletroduto 3/4":91914|Tubo aço carbono 1":74156|2":74157|4":74159|Válvula esfera:74163|Bomba centrífuga:98300
 ${BASE}`,
+
 "Gás Industrial":`Especialista em gás industrial/processo (NBR 15526). Extraia: TUBULAÇÕES (m por ø e material: aço carbono/cobre/PEAD), VÁLVULAS (contar por tipo e ø), SUPORTES (a cada 1,5m para ø≤2"), INSTRUMENTAÇÃO (contar manômetros/transmissores), EQUIPAMENTOS (reguladores/filtros — contar), ISOLAMENTO (m com isolamento).
 SINAPIs: Aço carbono 1":74156|2":74157|3":74158|4":74159|6":74160|Cobre 15mm:74161|28mm:74162|Válvula esfera inox 1":74163|2":74164|Suporte sela:74165|Isolamento:74166|Regulador pressão:74203
 ${BASE}`,
+
+"EstruturaMet":`ATENÇÃO: Esta prancha é de ESTRUTURA METÁLICA (ST = Steel Structure).
+Na maioria das obras industriais BYD/automotivas, a estrutura metálica (terças, treliças, perfis de aço, cobertura metálica) é executada por empresa especializada SEPARADA do escopo da obra civil/concreto.
+
+VERIFIQUE O ESCOPO DA OBRA antes de extrair:
+- Se "Estrutura metálica" está listado como item FORA DO ESCOPO → retorne JSON com itens=[] e alerta explicando.
+- Se está DENTRO do escopo → extraia: perfis de aço (kg por perfil: W, U, tubo, cantoneira), terças (m por perfil), parafusos (contar), chapas de ligação (m² de chapa), pintura anticorrosiva (m²).
+
+SINAPIs: Estrutura metálica fornec.+mont.:98210|Perfil W aço:94100|Perfil U:94101|Terça Z:94102|Parafuso A325:94105|Chapa de ligação:94106|Pintura epoxi:87880
+${BASE}`,
 };
 
-function getPrompt(d, obraCtx = "") {
+function getPrompt(d, obraCtx = "", fileName = "") {
+  const tipoPranchaAviso = avisoTipoPrancha(fileName);
   const base = PROMPTS[d] || `Especialista em engenharia civil brasileira. Extraia todos os quantitativos pelas cotas e símbolos visíveis. Sugira código SINAPI Bahia para cada item. ${BASE}`;
-  if (!obraCtx) return base;
-  return `${obraCtx}\n\n${base}`;
+  const partes = [];
+  if (tipoPranchaAviso) partes.push(tipoPranchaAviso);
+  if (obraCtx) partes.push(obraCtx);
+  partes.push(base);
+  return partes.join("\n\n");
 }
 
 // Monta contexto da obra para injetar no prompt
@@ -345,6 +541,8 @@ const DISC_COR = {
   "Dados e Voz":    {bg:"#fce7f3",text:"#9d174d",border:"#f9a8d4"},
   "SPDA":           {bg:"#fff7ed",text:"#9a3412",border:"#fdba74"},
   "Gás Industrial": {bg:"#f0fdf4",text:"#14532d",border:"#86efac"},
+  "EstruturaMet":   {bg:"#f1f5f9",text:"#475569",border:"#94a3b8"},
+  "Especificação":  {bg:"#fdf4ff",text:"#7e22ce",border:"#e879f9"},
 };
 const FONTE_COR = {
   "📐 Cota":       {bg:"#dbeafe",color:"#1e40af"},
@@ -810,7 +1008,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const obraAtualSnap = obras.find(o => o.id === obra.id);
         const plantasExist  = (obraAtualSnap?.plantas || []).filter(p => p.itens?.length > 0);
         const obraCtx       = montarObraCtx(obra, plantasExist);
-        const prompt        = getPrompt(pend.disciplina, obraCtx);
+        const prompt        = getPrompt(pend.disciplina, obraCtx, pend.nome || "");
         const todosItens=[];let ultimoParsed=null;
         const isPDF=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
         for(let i=0;i<pend.imgs.length;i++){
