@@ -541,7 +541,8 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   const [corrigindo,setCorrigindo]   = useState(false);
   const [correcoes,setCorrecoes]     = useState(null);  // preview antes de aplicar
   const [nAplicadas,setNAplicadas]   = useState(0);
-  const fileRef = useRef();
+  const fileRef   = useRef();
+  const folderRef = useRef();
   const ultimaRequisicao = useRef(0);
   const cliente = clientes.find(c=>c.id===obra.clienteId);
   const atualizar = (fn)=>setObras(p=>p.map(o=>o.id===obra.id?fn(o):o));
@@ -984,12 +985,22 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       <div onDrop={e=>{e.preventDefault();setDragOver(false);carregarArquivos(e.dataTransfer.files);}}
         onDragOver={e=>{e.preventDefault();setDragOver(true);}}
         onDragLeave={()=>setDragOver(false)}
-        onClick={()=>fileRef.current?.click()}
-        style={{border:`2px dashed ${dragOver?"#2563eb":"#d1d5db"}`,borderRadius:12,padding:"24px 20px",textAlign:"center",cursor:"pointer",background:dragOver?"#eff6ff":"#fafafa",marginBottom:16,transition:"all .15s"}}>
+        style={{border:`2px dashed ${dragOver?"#2563eb":"#d1d5db"}`,borderRadius:12,padding:"20px",textAlign:"center",background:dragOver?"#eff6ff":"#fafafa",marginBottom:16,transition:"all .15s"}}>
         <div style={{fontSize:28,marginBottom:6}}>📁</div>
         <div style={{fontSize:14,fontWeight:600,marginBottom:3}}>Arraste as plantas aqui</div>
-        <div style={{fontSize:12,color:"#9ca3af"}}>PDF do CAD (ARQ, ELE, HID, PLU, INC, HVAC...) — carregue todas e clique em Orçar</div>
+        <div style={{fontSize:12,color:"#9ca3af",marginBottom:14}}>PDF do CAD (ARQ, ELE, HID, PLU, INC, HVAC...) — carregue todas e clique em Orçar</div>
+        <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+          <button onClick={e=>{e.stopPropagation();fileRef.current?.click();}} style={{...S.btn,fontSize:12,padding:"7px 16px"}}>📄 Selecionar arquivos</button>
+          <button onClick={e=>{e.stopPropagation();folderRef.current?.click();}} style={{...S.btn,fontSize:12,padding:"7px 16px"}}>📂 Selecionar pasta</button>
+        </div>
         <input ref={fileRef} type="file" multiple accept=".pdf,image/*" style={{display:"none"}} onChange={e=>carregarArquivos(e.target.files)}/>
+        <input ref={folderRef} type="file" multiple accept=".pdf,image/*" style={{display:"none"}}
+          {...{webkitdirectory:"",directory:""}}
+          onChange={e=>{
+            const pdfs = Array.from(e.target.files).filter(f=>f.type==="application/pdf"||f.type.startsWith("image/"));
+            carregarArquivos(pdfs);
+            e.target.value="";
+          }}/>
       </div>
 
       {/* Lista de pendentes */}
