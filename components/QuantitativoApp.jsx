@@ -684,7 +684,7 @@ function SecaoObras({obras,setObras,clientes}) {
   const [plantaAtiva,setPlantaAtiva] = useState(null);
   const [showForm,setShowForm]       = useState(false);
   const [filtro,setFiltro]           = useState("todos");
-  const [form,setForm]               = useState({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:"",escopo_excluir:[]});
+  const [form,setForm]               = useState({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:"",escopo_excluir:[],fator_mercado:100});
 
   const criar=()=>{
     if(!form.nome.trim())return;
@@ -737,6 +737,17 @@ function SecaoObras({obras,setObras,clientes}) {
             </div>
           </div>
           <div style={{marginBottom:12}}><label style={S.label}>Descrição</label><input style={S.input} value={form.descricao} onChange={e=>setForm(p=>({...p,descricao:e.target.value}))} placeholder="Localização, contrato..."/></div>
+          <div style={{marginBottom:12}}>
+            <label style={S.label}>Fator preço de mercado (% do SINAPI)</label>
+            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+              <input type="range" min={40} max={100} value={form.fator_mercado||100} onChange={e=>setForm(p=>({...p,fator_mercado:Number(e.target.value)}))} style={{flex:1}}/>
+              <input type="number" min={40} max={100} value={form.fator_mercado||100} onChange={e=>setForm(p=>({...p,fator_mercado:Number(e.target.value)}))} style={{...S.input,width:64,textAlign:"center"}}/>
+              <span style={{fontSize:12,color:"#6b7280",whiteSpace:"nowrap"}}>% do SINAPI</span>
+            </div>
+            <div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>
+              Preço real de mercado como % do SINAPI. Industrial BYD ≈ 65–70% · Comercial ≈ 75–85% · Residencial médio ≈ 85–95% · Use 100 para orçar pelo SINAPI integral.
+            </div>
+          </div>
           <div style={{marginBottom:12}}>
             <label style={S.label}>Itens fora do escopo da empresa (executados por terceiros)</label>
             <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6}}>
@@ -1064,7 +1075,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const obraAtualSnap = obras.find(o => o.id === obra.id);
         const plantasExist  = (obraAtualSnap?.plantas || []).filter(p => p.itens?.length > 0);
         const obraCtx       = montarObraCtx(obra, plantasExist);
-        const prompt        = getPrompt(pend.disciplina, obraCtx, pend.nome || "");
+        const prompt        = getPrompt(pend.disciplina, obraCtx, pend.fileName || "");
         const todosItens=[];let ultimoParsed=null;
         const isPDFBruto=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
         const nTiles=pend.imgs.length;
@@ -1731,6 +1742,8 @@ function SecaoOrcamento({obras}) {
   const totalSemBdi = comPreco.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
   const totalComBdi = totalSemBdi*(1+bdi/100);
 
+  const fatorMercado = (obra?.fator_mercado || 100) / 100;
+
   // Resumo por disciplina quando nenhuma planta selecionada
   const resumoObra=(obra?.plantas||[]).reduce((acc,p)=>{
     const d=p.disciplina||"Outros";
@@ -1776,9 +1789,10 @@ function SecaoOrcamento({obras}) {
       {/* Resumo da obra por disciplina */}
       {obra&&!plantaId&&Object.keys(resumoObra).length>0&&(
         <div style={{...S.card,overflow:"hidden",marginBottom:20}}>
-          <div style={{padding:"12px 16px",borderBottom:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{padding:"12px 16px",borderBottom:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
             <span style={{fontSize:13,fontWeight:600}}>{obra.nome} — Resumo por disciplina</span>
-            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+              {fatorMercado !== 1 && <span style={{fontSize:12,color:"#7c3aed",background:"#ede9fe",padding:"3px 10px",borderRadius:20}}>mercado {obra.fator_mercado}% SINAPI</span>}
               <span style={{fontSize:14,fontWeight:700,color:"#059669"}}>{fmtR(totalObra*(1+bdi/100))} <span style={{fontSize:11,fontWeight:400,color:"#6b7280"}}>c/ BDI {bdi}%</span></span>
               <button onClick={()=>exportarExcel(obra)} disabled={exportando} style={{...S.btnPrimary,padding:"6px 14px",fontSize:12,background:"#059669",opacity:exportando?0.6:1}}>
                 {exportando?"⏳ Gerando...":"↓ Excel (.xlsx)"}
@@ -1786,7 +1800,7 @@ function SecaoOrcamento({obras}) {
             </div>
           </div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-            <thead><tr>{["Disciplina","Plantas","Itens","Total sem BDI",`Total c/BDI ${bdi}%`].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <thead><tr>{["Disciplina","Plantas","Itens","Total sem BDI",`Total c/BDI ${bdi}%`,fatorMercado!==1?"Mercado (est.)":""].filter(Boolean).map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
             <tbody>
               {Object.entries(resumoObra).map(([d,v],j)=>{
                 const col=DISC_COR[d]||{};
@@ -1798,6 +1812,7 @@ function SecaoOrcamento({obras}) {
                     <td style={{...S.td,textAlign:"center"}}>{v.itens}</td>
                     <td style={{...S.td,textAlign:"right",fontWeight:600,color:"#059669"}}>{fmtR(v.total)}</td>
                     <td style={{...S.td,textAlign:"right",fontWeight:700,color:"#047857"}}>{fmtR(v.total*(1+bdi/100))}</td>
+                    {fatorMercado!==1&&<td style={{...S.td,textAlign:"right",fontWeight:600,color:"#7c3aed"}}>{fmtR(v.total*fatorMercado*(1+bdi/100))}</td>}
                   </tr>
                 );
               })}
@@ -1807,6 +1822,7 @@ function SecaoOrcamento({obras}) {
                 <td style={{...S.td,textAlign:"center",fontWeight:600}}>{Object.values(resumoObra).reduce((s,v)=>s+v.itens,0)}</td>
                 <td style={{...S.td,textAlign:"right",fontWeight:700,color:"#059669",fontSize:13}}>{fmtR(totalObra)}</td>
                 <td style={{...S.td,textAlign:"right",fontWeight:800,color:"#047857",fontSize:15}}>{fmtR(totalObra*(1+bdi/100))}</td>
+                {fatorMercado!==1&&<td style={{...S.td,textAlign:"right",fontWeight:800,color:"#7c3aed",fontSize:15}}>{fmtR(totalObra*fatorMercado*(1+bdi/100))}</td>}
               </tr>
             </tbody>
           </table>
@@ -1875,6 +1891,184 @@ function SecaoOrcamento({obras}) {
         <div style={{textAlign:"center",padding:"60px 0",color:"#9ca3af"}}>
           <div style={{fontSize:36,marginBottom:8}}>💰</div>
           <div style={{fontSize:14}}>Selecione uma obra para ver o orçamento.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Reservado — futura seção de histórico de obras concluídas
+function SecaoGabarito({obras,gabaritos,setGabaritos}) {
+  const [obraId,setObraId]     = useState("");
+  const [carregando,setCarregando] = useState(false);
+  const [erro,setErro]         = useState("");
+  const [busca,setBusca]       = useState("");
+  const fileRef = useRef();
+
+  const obra      = obras.find(o=>o.id===obraId);
+  const gabarito  = gabaritos[obraId] || null;
+
+  const carregarExcel = async(file) => {
+    if(!file || !obraId) return;
+    setCarregando(true); setErro("");
+    try {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const resp = await fetch("/api/gabarito", { method:"POST", body:form });
+      const data = await resp.json();
+      if(data.error) throw new Error(data.error);
+      setGabaritos(p=>({...p,[obraId]:{ ...data, carregadoEm: new Date().toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}), nomeArquivo: file.name }}));
+    } catch(e) {
+      setErro("Erro ao ler Excel: " + e.message);
+    }
+    setCarregando(false);
+  };
+
+  const removerGabarito = () => {
+    if(!obraId) return;
+    setGabaritos(p=>{ const n={...p}; delete n[obraId]; return n; });
+  };
+
+  const itensFiltrados = (gabarito?.itens || []).filter(i => {
+    if(!busca) return true;
+    return i.descricao.toLowerCase().includes(busca.toLowerCase()) ||
+           i.codigo.toLowerCase().includes(busca.toLowerCase());
+  });
+
+  // Calcula totais da IA para comparação
+  const totalIA = obra ? (obra.plantas||[]).reduce((s,p)=>(p.itens||[]).reduce((ss,i)=>ss+(i.preco_sinapi||0)*(i.qtd||0),ss),0) : 0;
+  const fatorMercado = (obra?.fator_mercado || 100) / 100;
+
+  return (
+    <div>
+      <h1 style={{fontSize:22,fontWeight:700,marginBottom:4}}>Gabarito</h1>
+      <p style={{fontSize:13,color:"#6b7280",marginBottom:24}}>Carregue o orçamento real aprovado para comparar com a extração da IA e calibrar futuras análises.</p>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:12,marginBottom:20,alignItems:"end"}}>
+        <div><label style={S.label}>Obra</label>
+          <select style={S.input} value={obraId} onChange={e=>setObraId(e.target.value)}>
+            <option value="">Selecione uma obra</option>
+            {obras.map(o=><option key={o.id} value={o.id}>{o.nome}{gabaritos[o.id]?" ✓":""}</option>)}
+          </select>
+        </div>
+        {obraId&&(
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={()=>fileRef.current?.click()} disabled={carregando} style={{...S.btnPrimary,padding:"8px 16px",fontSize:13}}>
+              {carregando?"⏳ Carregando...":"📂 Carregar Excel"}
+            </button>
+            {gabarito&&<button onClick={removerGabarito} style={{...S.btn,fontSize:13,color:"#dc2626",borderColor:"#fecaca"}}>✕ Remover</button>}
+            <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={e=>{if(e.target.files[0])carregarExcel(e.target.files[0]);e.target.value="";}}/>
+          </div>
+        )}
+      </div>
+
+      {erro&&<div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"10px 14px",marginBottom:16,fontSize:12,color:"#dc2626"}}>{erro}</div>}
+
+      {!obraId&&(
+        <div style={{textAlign:"center",padding:"60px 0",color:"#9ca3af"}}>
+          <div style={{fontSize:48,marginBottom:12}}>📊</div>
+          <div style={{fontSize:15,fontWeight:600,marginBottom:6}}>Selecione uma obra para ver o gabarito</div>
+          <div style={{fontSize:13}}>Carregue o Excel do orçamento executivo aprovado para comparar com a análise da IA e reduzir o erro.</div>
+        </div>
+      )}
+
+      {obraId&&!gabarito&&(
+        <div style={{...S.card,padding:32,textAlign:"center"}}>
+          <div style={{fontSize:36,marginBottom:12}}>📤</div>
+          <div style={{fontSize:15,fontWeight:600,marginBottom:8}}>Nenhum gabarito carregado para {obra?.nome}</div>
+          <div style={{fontSize:13,color:"#6b7280",maxWidth:480,margin:"0 auto",marginBottom:16}}>
+            Carregue o Excel do orçamento real executivo desta obra. O sistema irá parsear os itens e usá-los para calibrar automaticamente as próximas extrações de plantas desta obra.
+          </div>
+          <div style={{background:"#f0f9ff",border:"1px solid #bae6fd",borderRadius:8,padding:"12px 16px",fontSize:12,color:"#0369a1",textAlign:"left",display:"inline-block"}}>
+            <strong>Como funciona:</strong><br/>
+            1. Carregue o Excel do orçamento aprovado<br/>
+            2. O sistema detecta automaticamente as colunas (Descrição, Un, Qtd, Total)<br/>
+            3. Os maiores itens são injetados no prompt da IA como referência de escala<br/>
+            4. Quando a IA extrair uma quantidade muito diferente, ela revisará antes de retornar
+          </div>
+        </div>
+      )}
+
+      {gabarito&&(
+        <div>
+          {/* Painel de comparação */}
+          {totalIA > 0 && (()=>{
+            const diff = gabarito.total > 0 ? ((totalIA - gabarito.total) / gabarito.total * 100) : null;
+            const diffM = gabarito.total > 0 ? ((totalIA * fatorMercado - gabarito.total) / gabarito.total * 100) : null;
+            const corDiff = diff === null ? "#6b7280" : Math.abs(diff) <= 10 ? "#059669" : Math.abs(diff) <= 25 ? "#b45309" : "#dc2626";
+            const corDiffM = diffM === null ? "#6b7280" : Math.abs(diffM) <= 10 ? "#059669" : Math.abs(diffM) <= 25 ? "#b45309" : "#dc2626";
+            return (
+              <div style={{...S.card,padding:16,marginBottom:16,background:"#f0f9ff",border:"1px solid #bae6fd"}}>
+                <div style={{fontSize:13,fontWeight:700,color:"#0369a1",marginBottom:12}}>📊 Comparação: IA vs Gabarito</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10}}>
+                  {[
+                    {label:"Gabarito real",valor:fmtR(gabarito.total),sub:`MAT: ${fmtR(gabarito.totalMat||0)} · MO: ${fmtR(gabarito.totalMO||0)}`,cor:"#374151"},
+                    {label:"IA (SINAPI)",valor:fmtR(totalIA),sub:`${(obra?.plantas||[]).reduce((s,p)=>s+(p.itens?.length||0),0)} itens de ${(obra?.plantas||[]).length} plantas`,cor:"#059669"},
+                    {label:`IA (mercado ${obra?.fator_mercado||100}%)`,valor:fmtR(totalIA*fatorMercado),sub:"SINAPI × fator de mercado",cor:"#7c3aed"},
+                    {label:"Desvio SINAPI",valor:diff!==null?`${diff>=0?"+":""}${diff.toFixed(1)}%`:"—",sub:diff!==null?Math.abs(diff)<=10?"✓ dentro da meta ±10%":Math.abs(diff)<=25?"⚠ acima da meta":"✗ alto desvio":"—",cor:corDiff},
+                    {label:"Desvio mercado",valor:diffM!==null?`${diffM>=0?"+":""}${diffM.toFixed(1)}%`:"—",sub:diffM!==null?Math.abs(diffM)<=10?"✓ dentro da meta ±10%":Math.abs(diffM)<=25?"⚠ acima da meta":"✗ alto desvio":"—",cor:corDiffM},
+                  ].map(c=>(
+                    <div key={c.label} style={{background:"#fff",border:"1px solid #e0f2fe",borderRadius:8,padding:"10px 14px"}}>
+                      <div style={{fontSize:10,color:"#6b7280",marginBottom:3}}>{c.label}</div>
+                      <div style={{fontSize:16,fontWeight:700,color:c.cor}}>{c.valor}</div>
+                      <div style={{fontSize:10,color:"#9ca3af",marginTop:2}}>{c.sub}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Cabeçalho do gabarito */}
+          <div style={{...S.card,overflow:"hidden",marginBottom:16}}>
+            <div style={{padding:"12px 16px",borderBottom:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+              <div>
+                <div style={{fontSize:13,fontWeight:600}}>{gabarito.nomeArquivo}</div>
+                <div style={{fontSize:11,color:"#9ca3af"}}>Carregado em {gabarito.carregadoEm} · {gabarito.itens.length} itens · Abas: {(gabarito.sheets||[]).join(", ")}</div>
+              </div>
+              <div style={{display:"flex",gap:12,alignItems:"center"}}>
+                <span style={{fontSize:13,fontWeight:700,color:"#059669"}}>Total: {fmtR(gabarito.total)}</span>
+                {gabarito.totalMat > 0 && <span style={{fontSize:12,color:"#6b7280"}}>MAT: {fmtR(gabarito.totalMat)}</span>}
+                {gabarito.totalMO > 0 && <span style={{fontSize:12,color:"#6b7280"}}>MO: {fmtR(gabarito.totalMO)}</span>}
+              </div>
+            </div>
+
+            {/* Busca */}
+            <div style={{padding:"10px 16px",borderBottom:"1px solid #e5e7eb"}}>
+              <input style={{...S.input,fontSize:13}} value={busca} onChange={e=>setBusca(e.target.value)} placeholder="Filtrar itens..."/>
+            </div>
+
+            <div style={{overflowX:"auto",maxHeight:500,overflowY:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead style={{position:"sticky",top:0}}>
+                  <tr>{["Código","Descrição","Un","Qtd","Preço Unit.","Total","Seção"].map((h,i)=>(
+                    <th key={h} style={{...S.th,textAlign:[3,4,5].includes(i)?"right":"left"}}>{h}</th>
+                  ))}</tr>
+                </thead>
+                <tbody>
+                  {itensFiltrados.map((it,j)=>(
+                    <tr key={j} style={{background:j%2===0?"#fff":"#fafafa"}}>
+                      <td style={{...S.td,fontFamily:"monospace",fontSize:10,color:"#9ca3af",whiteSpace:"nowrap"}}>{it.codigo||"—"}</td>
+                      <td style={{...S.td,lineHeight:1.4,minWidth:220}}>{it.descricao}</td>
+                      <td style={{...S.td,textAlign:"center",color:"#6b7280"}}>{it.un||"—"}</td>
+                      <td style={{...S.td,textAlign:"right",fontWeight:600}}>{it.qtd > 0 ? fmt(it.qtd) : "—"}</td>
+                      <td style={{...S.td,textAlign:"right",color:"#6b7280"}}>{it.preco_unit > 0 ? fmtR(it.preco_unit) : "—"}</td>
+                      <td style={{...S.td,textAlign:"right",fontWeight:600,color:"#059669"}}>{it.total > 0 ? fmtR(it.total) : "—"}</td>
+                      <td style={{...S.td}}><span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:it.secao==="MAT"?"#dbeafe":it.secao==="MO"?"#dcfce7":"#f3f4f6",color:it.secao==="MAT"?"#1e40af":it.secao==="MO"?"#166534":"#374151"}}>{it.secao}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{background:"#f9fafb",borderTop:"2px solid #e5e7eb"}}>
+                    <td colSpan={4} style={{...S.td,textAlign:"right",fontWeight:600}}>Total ({itensFiltrados.length} itens filtrados)</td>
+                    <td/>
+                    <td style={{...S.td,textAlign:"right",fontWeight:700,color:"#059669",fontSize:13}}>{fmtR(itensFiltrados.reduce((s,i)=>s+i.total,0))}</td>
+                    <td/>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
         </div>
       )}
     </div>
