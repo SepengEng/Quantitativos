@@ -159,6 +159,13 @@ INSTRUÇÕES DE ORÇAMENTISTA PROFISSIONAL:
 5. NUNCA retorne lista vazia se houver qualquer elemento quantificável visível — extraia o máximo possível
 6. Para cada item, sugira o código SINAPI Bahia Não Desonerado mais preciso
 
+REGRA ANTI-DUPLICAÇÃO — OBRIGATÓRIA:
+- Cada elemento físico deve aparecer UMA ÚNICA VEZ no JSON, independente de quantas vistas o mostrem
+- Se o mesmo elemento aparece em planta baixa E em corte/elevação/detalhe: extraia APENAS da vista com cota mais confiável (cota explícita > escala > inferência)
+- Itens com mesma localização e mesma natureza (ex: "Concreto FCK30 em Pilares - Térreo") NÃO devem se repetir
+- Ao processar PDF com múltiplas pranchas: consolide elementos do mesmo tipo e localização em UM único item com quantidade total
+- Em pranchas de detalhe: os elementos já estão contabilizados na prancha de planta — NÃO some novamente
+
 Fonte de medição a usar em cada item:
 "📐 Cota" = dimensão lida de cota explícita no desenho
 "🔢 Contagem" = elementos contados símbolo a símbolo
@@ -232,6 +239,12 @@ function montarObraCtx(obra, plantasExistentes) {
       partes.push(`EXEMPLOS DE ITENS JÁ EXTRAÍDOS NESTA OBRA (use como referência de escala e padrão):\n${exemplos.join("\n")}`);
     }
   }
+  // Escopo da empresa — itens a excluir
+  const excluir = (obra.escopo_excluir || []).filter(Boolean);
+  if (excluir.length > 0) {
+    partes.push(`ITENS FORA DO ESCOPO DESTA EMPRESA — NÃO EXTRAIA:\n${excluir.map(e=>`  - ${e}`).join("\n")}\nSe aparecerem no desenho, ignore completamente. Eles são executados por terceiros.`);
+  }
+
   // Lições aprendidas de erros anteriores corrigidos pela IA
   const licoes = getLicoes();
   if (licoes.length > 0) {
@@ -254,6 +267,47 @@ function checaConsistencia(itens, disciplina) {
   if (ratio < 50)  return { tipo: "aviso", ratio, msg: `Ratio aço/concreto = ${ratio.toFixed(0)} kg/m³ — abaixo do esperado (80–350 kg/m³). Verifique se toda armação foi extraída.` };
   if (ratio > 400) return { tipo: "aviso", ratio, msg: `Ratio aço/concreto = ${ratio.toFixed(0)} kg/m³ — acima do esperado (80–350 kg/m³). Possível duplicação de quantitativo.` };
   return { tipo: "ok", ratio, msg: `Ratio aço/concreto = ${ratio.toFixed(0)} kg/m³ — dentro da faixa esperada (80–350 kg/m³).` };
+}
+
+// ─── DEDUPLICAÇÃO PÓS-EXTRAÇÃO ───────────────────────────────────────────────
+function normStr(s) {
+  return String(s||"").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/[^a-z0-9]/g," ").replace(/\s+/g," ").trim();
+}
+
+function deduplicarItens(itens) {
+  const CONF_PESO = { alta:0, media:1, baixa:2 };
+  const mapa = new Map();
+
+  for (const it of itens) {
+    // Chave: primeiros 45 chars da desc normalizada + unidade + localização normalizada
+    const chave = `${normStr(it.descricao).slice(0,45)}|${(it.un||"").toLowerCase()}|${normStr(it.localizacao||"")}`;
+
+    if (!mapa.has(chave)) {
+      mapa.set(chave, { ...it, _dupCount: 1 });
+    } else {
+      const ex = mapa.get(chave);
+      const pesoEx  = CONF_PESO[ex.confianca||"media"] ?? 1;
+      const pesoNew = CONF_PESO[it.confianca||"media"] ?? 1;
+      // Mantém o de maior confiança; se igual, mantém o primeiro (evita soma acidental)
+      if (pesoNew < pesoEx) {
+        mapa.set(chave, { ...it, _dupCount: ex._dupCount + 1 });
+      } else {
+        ex._dupCount += 1;
+      }
+    }
+  }
+
+  const resultado = [...mapa.values()];
+  const nDup = itens.length - resultado.length;
+  if (nDup > 0) console.log(`[Dedup] ${nDup} itens duplicados removidos (${itens.length} → ${resultado.length})`);
+  return resultado;
+}
+
+// ─── ESCOPO — verifica se item está fora do escopo da empresa ────────────────
+function itemForaDoEscopo(item, excluirKeywords) {
+  if (!excluirKeywords?.length) return false;
+  const texto = normStr(`${item.descricao} ${item.sinapi_descricao||""} ${item.mat_descricao||""}`);
+  return excluirKeywords.some(kw => kw.trim() && texto.includes(normStr(kw)));
 }
 
 // ─── LIÇÕES APRENDIDAS (localStorage) ────────────────────────────────────────
@@ -423,12 +477,12 @@ function SecaoObras({obras,setObras,clientes}) {
   const [plantaAtiva,setPlantaAtiva] = useState(null);
   const [showForm,setShowForm]       = useState(false);
   const [filtro,setFiltro]           = useState("todos");
-  const [form,setForm]               = useState({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:""});
+  const [form,setForm]               = useState({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:"",escopo_excluir:[]});
 
   const criar=()=>{
     if(!form.nome.trim())return;
     const nova={id:uid(),...form,criadoEm:new Date().toLocaleDateString("pt-BR"),plantas:[]};
-    setObras(p=>[...p,nova]);setForm({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:""});setShowForm(false);setObraAtiva(nova.id);
+    setObras(p=>[...p,nova]);setForm({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:"",escopo_excluir:[]});setShowForm(false);setObraAtiva(nova.id);
   };
 
   const obra   = obras.find(o=>o.id===obraAtiva);
@@ -476,6 +530,17 @@ function SecaoObras({obras,setObras,clientes}) {
             </div>
           </div>
           <div style={{marginBottom:12}}><label style={S.label}>Descrição</label><input style={S.input} value={form.descricao} onChange={e=>setForm(p=>({...p,descricao:e.target.value}))} placeholder="Localização, contrato..."/></div>
+          <div style={{marginBottom:12}}>
+            <label style={S.label}>Itens fora do escopo da empresa (executados por terceiros)</label>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:6}}>
+              {["Aço de armadura / CA-50 / CA-60","Estrutura metálica","Estacas / Fundações especiais","Instalações hidrossanitárias","Instalações elétricas AT","HVAC / Climatização","Impermeabilização"].map(op=>{
+                const sel = (form.escopo_excluir||[]).includes(op);
+                return <button key={op} type="button" onClick={()=>setForm(p=>({...p,escopo_excluir:sel?p.escopo_excluir.filter(x=>x!==op):[...(p.escopo_excluir||[]),op]}))}
+                  style={{fontSize:11,padding:"4px 10px",borderRadius:20,border:`1px solid ${sel?"#dc2626":"#d1d5db"}`,background:sel?"#fee2e2":"#fff",color:sel?"#dc2626":"#6b7280",cursor:"pointer"}}>{sel?"✕ ":""}{op}</button>;
+              })}
+            </div>
+            <div style={{fontSize:11,color:"#9ca3af"}}>A IA não extrairá esses itens. Clique para selecionar/desselecionar.</div>
+          </div>
           <div style={{display:"flex",gap:8}}>
             <button onClick={criar} style={S.btnPrimary}>Criar</button>
             <button onClick={()=>setShowForm(false)} style={S.btn}>Cancelar</button>
@@ -829,11 +894,15 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           todosItens.push(...(parsed.itens||[]));
           ultimoParsed=parsed;
         }
+        // Deduplica itens antes de enriquecer (remove elementos contados múltiplas vezes)
+        const itensDedup = deduplicarItens(todosItens);
+
         // Buscar preços SINAPI + UNs para validação
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Buscando preços SINAPI..."}:x));
-        const { precoMap, unMap } = await resolverPrecosBatch(todosItens);
+        const { precoMap, unMap } = await resolverPrecosBatch(itensDedup);
         const disciplinaFinal = ultimoParsed?.disciplina || pend.disciplina;
-        const itensEnriquecidos=todosItens.map(it=>{
+        const escopo_excluir = obra.escopo_excluir || [];
+        const itensEnriquecidos=itensDedup.map(it=>{
           const codigoFinal  = it._sinapi_real?.codigo || it.sinapi_sugerido;
           const unSinapi     = unMap[codigoFinal] || it._sinapi_real?.un || null;
           const unValida     = unCompativel(it.un, unSinapi);
@@ -847,6 +916,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             un_sinapi:        unSinapi,
             un_valida:        unValida,
             confianca,
+            fora_escopo:      itemForaDoEscopo(it, escopo_excluir),
             _sinapi_top3:     it._sinapi_top3 || [],
           };
         });
@@ -1105,16 +1175,18 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
   const [verificando,setVerificando] = useState(false);
   const [verificacao,setVerificacao] = useState(null);
 
-  const itens     = planta.itens||[];
-  let filtrados   = filtro==="Todos"?itens:itens.filter(i=>i.fonte===filtro);
-  filtrados       = filtroConf==="Todos"?filtrados:filtrados.filter(i=>(i.confianca||"media")===filtroConf);
-  const comPreco    = itens.filter(i=>i.preco_sinapi);
+  const itens       = planta.itens||[];
+  const itensEscopo = itens.filter(i=>!i.fora_escopo);
+  const itensExcl   = itens.filter(i=>i.fora_escopo);
+  let filtrados     = filtro==="Todos"?itensEscopo:itensEscopo.filter(i=>i.fonte===filtro);
+  filtrados         = filtroConf==="Todos"?filtrados:filtrados.filter(i=>(i.confianca||"media")===filtroConf);
+  const comPreco    = itensEscopo.filter(i=>i.preco_sinapi);
   const totalSemBdi = comPreco.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
   const totalComBdi = totalSemBdi*(1+bdi/100);
-  const cobertura   = itens.length?Math.round((comPreco.length/itens.length)*100):0;
+  const cobertura   = itensEscopo.length?Math.round((comPreco.length/itensEscopo.length)*100):0;
   const col         = DISC_COR[planta.disciplina]||{};
-  const nUnInvalidas = itens.filter(i=>i.un_valida===false).length;
-  const nBaixa      = itens.filter(i=>i.confianca==="baixa").length;
+  const nUnInvalidas = itensEscopo.filter(i=>i.un_valida===false).length;
+  const nBaixa      = itensEscopo.filter(i=>i.confianca==="baixa").length;
 
   const verificarQuantitativos = async () => {
     if (verificando || itens.length === 0) return;
@@ -1170,6 +1242,7 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
           {label:"SINAPI cobertos",valor:`${cobertura}%`,cor:cobertura>=70?"#059669":"#f59e0b"},
           {label:"Conf. baixa",valor:nBaixa,cor:nBaixa>0?"#b45309":"#059669",hint:"Itens estimados por escala/inferência"},
           {label:"UN inválida",valor:nUnInvalidas,cor:nUnInvalidas>0?"#dc2626":"#059669",hint:"Unidade do item ≠ unidade SINAPI"},
+          {label:"Fora do escopo",valor:itensExcl.length,cor:itensExcl.length>0?"#6b7280":"#059669",hint:"Executados por terceiros — excluídos do total"},
           {label:"Total sem BDI",valor:fmtR(totalSemBdi),cor:"#059669"},
           {label:`Com BDI ${bdi}%`,valor:fmtR(totalComBdi),cor:"#059669"},
         ].map(c=>(
@@ -1273,6 +1346,22 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
           </table>
         </div>
       </div>
+
+      {itensExcl.length>0&&(
+        <div style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:10,padding:"12px 16px",marginBottom:14}}>
+          <div style={{fontSize:12,fontWeight:700,color:"#6b7280",marginBottom:8}}>🚫 Fora do escopo — {itensExcl.length} item{itensExcl.length!==1?"s":""} excluído{itensExcl.length!==1?"s":""} do orçamento (executados por terceiros)</div>
+          <div style={{display:"flex",flexDirection:"column",gap:4}}>
+            {itensExcl.map((it,j)=>(
+              <div key={j} style={{fontSize:11,color:"#9ca3af",display:"flex",gap:12,padding:"4px 0",borderBottom:"1px solid #f3f4f6"}}>
+                <span style={{fontFamily:"monospace",flexShrink:0}}>{it.codigo_item}</span>
+                <span style={{flex:1,textDecoration:"line-through"}}>{it.descricao}</span>
+                <span>{it.qtd} {it.un}</span>
+                <span>{it.preco_sinapi?fmtR(it.preco_sinapi*(it.qtd||0)):"—"}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {planta.alertas?.length>0&&(
         <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:10,padding:"12px 16px"}}>
