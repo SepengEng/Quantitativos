@@ -429,6 +429,114 @@ function getPrompt(d, obraCtx = "", fileName = "") {
   return partes.join("\n\n");
 }
 
+// Prompt especializado para dados DXF (texto estruturado, não imagem)
+function getDxfPrompt(disciplina, obraCtx, dxfData) {
+  const { layers, blocos, textos, dimensoes, resumo } = dxfData;
+
+  const layersSummary = Object.entries(layers)
+    .map(([nome, L]) => {
+      const partes = [`Layer "${nome}": ${L.contagem} entidades (${L.tipos.join(",")})`];
+      if (L.comprimento > 0.01) partes.push(`compr.=${L.comprimento}m`);
+      if (L.area > 0.01)        partes.push(`área=${L.area}m²`);
+      if (Object.keys(L.blocos).length > 0) partes.push(`blocos: ${Object.entries(L.blocos).map(([k,v])=>`${k}×${v}`).join(", ")}`);
+      if (L.textos.length > 0)  partes.push(`textos: "${L.textos.slice(0,5).join('", "')}"`);
+      return partes.join(" | ");
+    })
+    .join("\n");
+
+  const blocosSummary = Object.entries(blocos)
+    .slice(0, 30)
+    .map(([nome, b]) => `  ${nome}: ${b.contagem}× (layers: ${Object.keys(b.layers).join(",")})`)
+    .join("\n");
+
+  const textosSample = textos.slice(0, 40).map(t => `  [${t.layer}] "${t.texto}"`).join("\n");
+
+  const dimSample = dimensoes.slice(0, 20).map(d => `  ${d.valor_m.toFixed(3)}m (layer: ${d.layer})`).join("\n");
+
+  const discPrompt = PROMPTS[disciplina] || `Especialista em engenharia civil. Identifique os elementos construtivos e extraia quantidades. ${BASE}`;
+
+  return `${obraCtx ? obraCtx + "\n\n" : ""}FONTE DE DADOS: ARQUIVO DXF do AutoCAD — dados geométricos EXATOS, não estimados.
+Os valores de comprimento e área foram calculados matematicamente a partir das coordenadas reais do desenho CAD.
+Unidade detectada: ${resumo.unidade_detectada} → todos os valores já convertidos para metros e m².
+${resumo.escala ? `Escala declarada no arquivo: ${resumo.escala}` : ""}
+
+RESUMO DO ARQUIVO:
+- ${resumo.total_layers} layers com dados
+- Comprimento total acumulado: ${resumo.total_comprimento_m}m
+- Área total acumulada: ${resumo.total_area_m2}m²
+- Total de blocos/símbolos inseridos: ${resumo.total_blocos}
+
+LAYERS E MEDIÇÕES:
+${layersSummary}
+
+BLOCOS (símbolos inseridos — cada ocorrência = 1 elemento):
+${blocosSummary || "  (nenhum bloco)"}
+
+TEXTOS/ANOTAÇÕES ENCONTRADOS:
+${textosSample || "  (nenhum)"}
+
+DIMENSÕES EXPLÍCITAS:
+${dimSample || "  (nenhuma)"}
+
+${discPrompt}
+
+INSTRUÇÕES ESPECIAIS PARA DXF:
+- Os valores de comprimento/área acima são EXATOS — use-os diretamente sem converter
+- Para cada layer, identifique a que elemento construtivo corresponde pelo nome do layer
+- Layers com padrões como PILAR, PIL, P_EST, KZ → pilares
+- Layers VIGA, VIG, V_EST, VSP → vigas
+- Layers PAREDE, PAR, ALV, BLK → alvenaria
+- Layers PISO, LAJE, LAJ, SLB → laje/piso
+- Layers PORTA, P01, JNL, JANELA → esquadrias
+- Layers ELET, ILUM, QDR, CRC → elétrica
+- Layers TUBO, HID, ESG, AGF → hidrossanitária
+- Blocos com contagem = quantidade exata daquele elemento
+- Se um layer tem comprimento E área, o comprimento é o perímetro e a área é a superfície
+
+Retorne JSON com as quantidades EXATAS dos dados acima. A confiança deve ser "alta" para todos os itens baseados em dados DXF.`;
+}
+
+// Fatores de preço SINAPI por categoria (% do SINAPI Bahia)
+// Categorias mapeadas para grupo de SINAPI codes
+const CATEGORIAS_SINAPI = {
+  "Concreto (FCK)":          { desc: "FCK20/25/30/35 bombeado e convencional", default: 65 },
+  "Formas / Cimbramento":    { desc: "Compensado, metálica, sistema pontalete", default: 80 },
+  "Escavação / Terraplanagem":{ desc: "Manual e mecanizada, compactação", default: 85 },
+  "Alvenaria / Vedação":     { desc: "Blocos cerâmico, concreto, cimentício, drywall", default: 82 },
+  "Revestimento / Pintura":  { desc: "Reboco, cerâmica, porcelanato, tinta", default: 80 },
+  "Cobertura / Impermeabilização":{ desc: "Telhas, manta, membrana, calha", default: 78 },
+  "Elétrica / SPDA / CFTV":  { desc: "Eletrodutos, cabos, luminárias, QDC, CFTV", default: 88 },
+  "Hidrossanitária / Pluvial":{ desc: "Tubos, conexões, louças, caixas", default: 85 },
+  "Incêndio / HVAC":         { desc: "Sprinkler, detectores, splits, dutos", default: 90 },
+  "Esquadrias (portas/janelas)":{ desc: "Alumínio, aço, madeira, vidro", default: 85 },
+  "Pavimentação / Piso industrial":{ desc: "Concreto polido, epóxi, antiestático", default: 75 },
+  "Mão de obra (MO)":        { desc: "Pedreiro, servente, eletricista — hora", default: 92 },
+};
+
+function aplicarFatorCategoria(descricao, precoSinapi, fatoresCategorias) {
+  if (!precoSinapi || !fatoresCategorias) return precoSinapi;
+  const dn = (descricao || "").toLowerCase();
+  for (const [cat, { default: df }] of Object.entries(CATEGORIAS_SINAPI)) {
+    const fator = (fatoresCategorias[cat] ?? df) / 100;
+    // Match heurístico por palavra-chave
+    if ((cat.includes("Concreto") && (dn.includes("concreto") || dn.includes("fck"))) ||
+        (cat.includes("Formas") && (dn.includes("form") || dn.includes("cimbr"))) ||
+        (cat.includes("Escavação") && (dn.includes("escava") || dn.includes("terrapl"))) ||
+        (cat.includes("Alvenaria") && (dn.includes("alven") || dn.includes("bloco") || dn.includes("dry"))) ||
+        (cat.includes("Revestimento") && (dn.includes("reboc") || dn.includes("ceràm") || dn.includes("porcela") || dn.includes("pint") || dn.includes("revestim"))) ||
+        (cat.includes("Cobertura") && (dn.includes("cobert") || dn.includes("telh") || dn.includes("imperm") || dn.includes("manta") || dn.includes("calha"))) ||
+        (cat.includes("Elétrica") && (dn.includes("eletr") || dn.includes("luminár") || dn.includes("cabo") || dn.includes("eletrod") || dn.includes("spda") || dn.includes("cftv"))) ||
+        (cat.includes("Hidrossanitária") && (dn.includes("hid") || dn.includes("tubo") || dn.includes("esgoto") || dn.includes("pluvial") || dn.includes("drena"))) ||
+        (cat.includes("Incêndio") && (dn.includes("incêndio") || dn.includes("sprink") || dn.includes("hvac") || dn.includes("split") || dn.includes("duto"))) ||
+        (cat.includes("Esquadrias") && (dn.includes("porta") || dn.includes("janela") || dn.includes("esquadr"))) ||
+        (cat.includes("Pavimentação") && (dn.includes("piso") || dn.includes("pavim") || dn.includes("epóxi") || dn.includes("polido"))) ||
+        (cat.includes("Mão de obra") && (dn.includes("mão de obra") || dn.includes("servente") || dn.includes("pedreiro") || dn.includes("oficial")))) {
+      return precoSinapi * fator;
+    }
+  }
+  return precoSinapi * ((fatoresCategorias["Revestimento / Pintura"] ?? 80) / 100); // fallback genérico
+}
+
 // Monta contexto da obra para injetar no prompt
 function montarObraCtx(obra, plantasExistentes) {
   const partes = [];
@@ -684,7 +792,8 @@ function SecaoObras({obras,setObras,clientes}) {
   const [plantaAtiva,setPlantaAtiva] = useState(null);
   const [showForm,setShowForm]       = useState(false);
   const [filtro,setFiltro]           = useState("todos");
-  const [form,setForm]               = useState({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:"",escopo_excluir:[],fator_mercado:100});
+  const [form,setForm]               = useState({nome:"",clienteId:"",descricao:"",tipo_obra:"",padrao:"",escopo_excluir:[],fator_mercado:100,fatores_categorias:{}});
+  const [showFatores,setShowFatores] = useState(false);
 
   const criar=()=>{
     if(!form.nome.trim())return;
@@ -738,14 +847,36 @@ function SecaoObras({obras,setObras,clientes}) {
           </div>
           <div style={{marginBottom:12}}><label style={S.label}>Descrição</label><input style={S.input} value={form.descricao} onChange={e=>setForm(p=>({...p,descricao:e.target.value}))} placeholder="Localização, contrato..."/></div>
           <div style={{marginBottom:12}}>
-            <label style={S.label}>Fator preço de mercado (% do SINAPI)</label>
-            <div style={{display:"flex",gap:10,alignItems:"center"}}>
-              <input type="range" min={40} max={100} value={form.fator_mercado||100} onChange={e=>setForm(p=>({...p,fator_mercado:Number(e.target.value)}))} style={{flex:1}}/>
-              <input type="number" min={40} max={100} value={form.fator_mercado||100} onChange={e=>setForm(p=>({...p,fator_mercado:Number(e.target.value)}))} style={{...S.input,width:64,textAlign:"center"}}/>
-              <span style={{fontSize:12,color:"#6b7280",whiteSpace:"nowrap"}}>% do SINAPI</span>
-            </div>
-            <div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>
-              Preço real de mercado como % do SINAPI. Industrial BYD ≈ 65–70% · Comercial ≈ 75–85% · Residencial médio ≈ 85–95% · Use 100 para orçar pelo SINAPI integral.
+            <label style={S.label}>Preços de mercado (% do SINAPI)</label>
+            <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:8,padding:"10px 14px"}}>
+              <div style={{display:"flex",gap:10,alignItems:"center",marginBottom:8}}>
+                <span style={{fontSize:12,color:"#374151",flex:1}}>Fator geral (fallback quando categoria não mapeada)</span>
+                <input type="number" min={40} max={100} value={form.fator_mercado||100} onChange={e=>setForm(p=>({...p,fator_mercado:Number(e.target.value)}))} style={{...S.input,width:64,textAlign:"center",fontSize:13}}/>
+                <span style={{fontSize:12,color:"#6b7280"}}>% SINAPI</span>
+              </div>
+              <button type="button" onClick={()=>setShowFatores(v=>!v)} style={{...S.btn,fontSize:11,padding:"3px 10px",marginBottom:showFatores?8:0}}>
+                {showFatores?"▲ Ocultar":"▼ Configurar por categoria"}
+              </button>
+              {showFatores&&(
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginTop:6}}>
+                  {Object.entries(CATEGORIAS_SINAPI).map(([cat,{desc,default:df}])=>{
+                    const val = form.fatores_categorias?.[cat] ?? df;
+                    return (
+                      <div key={cat} style={{display:"flex",gap:6,alignItems:"center",background:"#fff",border:"1px solid #e5e7eb",borderRadius:6,padding:"5px 8px"}}>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:11,fontWeight:500,color:"#374151",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{cat}</div>
+                          <div style={{fontSize:10,color:"#9ca3af",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{desc}</div>
+                        </div>
+                        <input type="number" min={40} max={100} value={val}
+                          onChange={e=>setForm(p=>({...p,fatores_categorias:{...p.fatores_categorias,[cat]:Number(e.target.value)}}))}
+                          style={{width:50,padding:"3px 6px",border:"1px solid #d1d5db",borderRadius:5,fontSize:12,textAlign:"center"}}/>
+                        <span style={{fontSize:10,color:"#9ca3af"}}>%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div style={{fontSize:11,color:"#9ca3af",marginTop:6}}>Industrial BYD: Concreto 65% · Formas 80% · Elétrica 88%. Comercial/Residencial: valores mais próximos de 85–95%.</div>
             </div>
           </div>
           <div style={{marginBottom:12}}>
@@ -1017,17 +1148,26 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   // Carregar arquivos (sem analisar ainda)
   const carregarArquivos = async(files)=>{
     setErro("");
-    const novos=[];
     for(const file of Array.from(files)){
       const disc=detectarDisciplina(file.name);
       const id=uid();
-      setPendentes(p=>[...p,{id,fileName:file.name,disciplina:disc,imgs:null,status:"carregando",progresso:"Lendo arquivo..."}]);
+      const isDXF = file.name.toLowerCase().endsWith(".dxf");
+      setPendentes(p=>[...p,{id,fileName:file.name,disciplina:disc,imgs:null,dxfData:null,status:"carregando",progresso:"Lendo arquivo..."}]);
       try{
-        let imgs=[];
-        let progDesc="";
-        if(file.type==="application/pdf"){
-          // Renderiza em alta resolução (3×) e divide em tiles para Gemini ler cotas pequenas
+        if(isDXF){
+          // DXF: extrai dados geométricos exatos no servidor
+          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Extraindo geometria do DXF..."}:x));
+          const form=new FormData(); form.append("file",file,file.name);
+          const resp=await fetch("/api/parse-dxf",{method:"POST",body:form});
+          const dxfData=await resp.json();
+          if(dxfData.error) throw new Error(dxfData.error);
+          const nL=dxfData.resumo?.total_layers||0;
+          const nB=dxfData.resumo?.total_blocos||0;
+          setPendentes(p=>p.map(x=>x.id===id?{...x,dxfData,status:"pronto",progresso:`DXF ✓ · ${nL} layers · ${nB} blocos · ${disc||"disciplina a detectar"}`}:x));
+        } else if(file.type==="application/pdf"||file.name.toLowerCase().endsWith(".pdf")){
+          // PDF: renderiza em alta resolução e divide em tiles
           setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Renderizando em alta resolução..."}:x));
+          let imgs=[]; let progDesc="";
           try {
             imgs = await pdfParaImagensTiles(file,
               (msg) => setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
@@ -1035,7 +1175,6 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             progDesc = `${imgs.length} tile${imgs.length>1?"s":""} alta res.`;
           } catch (renderErr) {
             console.warn("[PDF tiles] falhou, enviando PDF bruto como fallback:", renderErr);
-            // Fallback: envia como PDF bruto caso pdfjs-dist falhe
             const tamanhoMB=(file.size/1024/1024).toFixed(1);
             if(file.size > 3_000_000){
               const {fileUri, mimeType} = await uploadParaGeminiFileAPI(file,
@@ -1048,12 +1187,13 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
               progDesc=`PDF bruto · ${tamanhoMB} MB`;
             }
           }
+          setPendentes(p=>p.map(x=>x.id===id?{...x,imgs,status:"pronto",progresso:`${progDesc} · ${disc||"disciplina a detectar"}`}:x));
         } else if(file.type.startsWith("image/")){
-          imgs=[{base64:await toB64(file),type:file.type}];
-          progDesc=`${imgs.length} pág.`;
-        } else { setPendentes(p=>p.filter(x=>x.id!==id)); continue; }
-        setPendentes(p=>p.map(x=>x.id===id?{...x,imgs,status:"pronto",progresso:`${progDesc} · ${disc||"disciplina a detectar"}`}:x));
-        novos.push(id);
+          const imgs=[{base64:await toB64(file),type:file.type}];
+          setPendentes(p=>p.map(x=>x.id===id?{...x,imgs,status:"pronto",progresso:`1 imagem · ${disc||"disciplina a detectar"}`}:x));
+        } else {
+          setPendentes(p=>p.filter(x=>x.id!==id)); continue;
+        }
       } catch(e){
         setPendentes(p=>p.map(x=>x.id===id?{...x,status:"erro",progresso:"Erro ao ler: "+e.message}:x));
       }
@@ -1075,6 +1215,65 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const obraAtualSnap = obras.find(o => o.id === obra.id);
         const plantasExist  = (obraAtualSnap?.plantas || []).filter(p => p.itens?.length > 0);
         const obraCtx       = montarObraCtx(obra, plantasExist);
+
+        // ── Branch DXF: envia dados estruturados como texto, não como imagem ──
+        if(pend.dxfData){
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"IA quantificando DXF..."}:x));
+          const dxfPrompt = getDxfPrompt(pend.disciplina, obraCtx, pend.dxfData);
+          const dxfUserText = `Arquivo DXF: "${pend.fileName}" · Disciplina: ${pend.disciplina||"a identificar"}\n`
+            + `Resumo: ${pend.dxfData.resumo.total_layers} layers · ${pend.dxfData.resumo.total_comprimento_m}m comprimento total · `
+            + `${pend.dxfData.resumo.total_area_m2}m² área total · ${pend.dxfData.resumo.total_blocos} blocos.\n`
+            + "Quantifique todos os elementos baseado nos dados geométricos exatos fornecidos no sistema.";
+          const agora=Date.now();
+          const espThrottle=3500-(agora-ultimaRequisicao.current);
+          if(espThrottle>0) await new Promise(r=>setTimeout(r,espThrottle));
+          ultimaRequisicao.current=Date.now();
+          const reqBodyDxf=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:32768,system:dxfPrompt,
+            messages:[{role:"user",content:[{type:"text",text:dxfUserText}]}]});
+          let dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
+          for(let rt=0;rt<8&&dataDxf.error?.type==="rate_limit";rt++){
+            const espera=(dataDxf.error.retryAfter||30)*1000;
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s...`}:x));
+            await new Promise(r=>setTimeout(r,espera));
+            dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
+          }
+          if(dataDxf.error) throw new Error(`Gemini: ${dataDxf.error.message||dataDxf.error.type}`);
+          const dxfText=dataDxf.content?.find(b=>b.type==="text")?.text||"{}";
+          const dxfClean=dxfText.replace(/```json[\s\S]*?```|```[\s\S]*?```/g,m=>m.replace(/```json|```/g,"")).replace(/```json|```/g,"").trim();
+          let parsedDxf={itens:[]};
+          try{ parsedDxf=JSON.parse((dxfClean.match(/\{[\s\S]*\}/)||["{}"])[0]); }catch{}
+          const itensDedup=deduplicarItens(parsedDxf.itens||[]);
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Buscando preços SINAPI..."}:x));
+          const { precoMap, unMap } = await resolverPrecosBatch(itensDedup);
+          const disciplinaFinal=parsedDxf.disciplina||pend.disciplina;
+          const escopo_excluir=obra.escopo_excluir||[];
+          const fatoresCategorias=obra.fatores_categorias||{};
+          const itensEnriquecidos=itensDedup.map(it=>{
+            const codigoFinal=it._sinapi_real?.codigo||it.sinapi_sugerido;
+            const unSinapi=unMap[codigoFinal]||it._sinapi_real?.un||null;
+            const precoBase=it._sinapi_real?.preco||precoMap[it.sinapi_sugerido]||null;
+            const precoMercado=precoBase?aplicarFatorCategoria(it.descricao,precoBase,fatoresCategorias):null;
+            return{...it,sinapi_sugerido:codigoFinal,sinapi_descricao:it._sinapi_real?.descricao||it.sinapi_descricao,
+              preco_sinapi:precoBase,preco_mercado:precoMercado,un_sinapi:unSinapi,
+              un_valida:unCompativel(it.un,unSinapi),
+              confianca:it.confianca||"alta", // DXF = sempre alta confiança (dados exatos)
+              fora_escopo:itemForaDoEscopo(it,escopo_excluir),fonte:it.fonte||"📐 Cota",
+              _dxf:true};
+          });
+          const novaPlanta={id:uid(),fileName:pend.fileName,disciplina:disciplinaFinal,
+            escala:parsedDxf.escala||pend.dxfData.resumo?.escala,resumo:parsedDxf.resumo,
+            alertas:parsedDxf.alertas||[],itens:itensEnriquecidos,
+            consistencia:checaConsistencia(itensEnriquecidos,disciplinaFinal),
+            tipo_fonte:"DXF",
+            analisadoEm:new Date().toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"})};
+          atualizar(o=>({...o,plantas:[...(o.plantas||[]),novaPlanta]}));
+          const totalValor=itensEnriquecidos.reduce((s,i)=>s+(i.preco_mercado||i.preco_sinapi||0)*(i.qtd||0),0);
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"concluido",
+            progresso:itensEnriquecidos.length===0?`⚠️ 0 itens DXF — verifique layers`:
+            `✅ ${itensEnriquecidos.length} itens [DXF] · ${fmtR(totalValor)}`}:x));
+          continue; // pula o branch de imagem
+        }
+
         const prompt        = getPrompt(pend.disciplina, obraCtx, pend.fileName || "");
         const todosItens=[];let ultimoParsed=null;
         const isPDFBruto=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
@@ -1177,16 +1376,19 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const { precoMap, unMap } = await resolverPrecosBatch(itensDedup);
         const disciplinaFinal = ultimoParsed?.disciplina || pend.disciplina;
         const escopo_excluir = obra.escopo_excluir || [];
+        const fatoresCategorias = obra.fatores_categorias || {};
         const itensEnriquecidos=itensDedup.map(it=>{
           const codigoFinal  = it._sinapi_real?.codigo || it.sinapi_sugerido;
           const unSinapi     = unMap[codigoFinal] || it._sinapi_real?.un || null;
           const unValida     = unCompativel(it.un, unSinapi);
           const confianca    = it.confianca || (it.fonte === "📐 Cota" || it.fonte === "🔢 Contagem" ? "alta" : it.fonte === "🧮 Cálculo" ? "media" : "baixa");
+          const precoBase    = it._sinapi_real?.preco || precoMap[it.sinapi_sugerido] || null;
           return {
             ...it,
             sinapi_sugerido:  codigoFinal,
             sinapi_descricao: it._sinapi_real?.descricao || it.sinapi_descricao,
-            preco_sinapi:     it._sinapi_real?.preco || precoMap[it.sinapi_sugerido] || null,
+            preco_sinapi:     precoBase,
+            preco_mercado:    precoBase ? aplicarFatorCategoria(it.descricao, precoBase, fatoresCategorias) : null,
             mat_preco:        precoMap[it.mat_sinapi] || null,
             un_sinapi:        unSinapi,
             un_valida:        unValida,
@@ -1322,8 +1524,9 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
 
       {/* Dica de nomenclatura */}
       <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:10,padding:"10px 16px",marginBottom:16,fontSize:12,color:"#166534"}}>
-        💡 Nomeie os arquivos com o prefixo da disciplina:
+        💡 Aceita <strong>PDF</strong> e <strong>DXF do AutoCAD</strong>. Nomeie com o prefixo da disciplina:
         <strong> ARQ- ELE- HID- PLU- INC- HVA- CFT- VOZ- SPD- GAS- EST-</strong>
+        <br/><span style={{color:"#0369a1"}}>DXF = precisão milimétrica (lê coordenadas exatas do CAD, não estimativas de imagem)</span>
       </div>
 
       {/* Zona de drop */}
@@ -1333,13 +1536,13 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         style={{border:`2px dashed ${dragOver?"#2563eb":"#d1d5db"}`,borderRadius:12,padding:"20px",textAlign:"center",background:dragOver?"#eff6ff":"#fafafa",marginBottom:16,transition:"all .15s"}}>
         <div style={{fontSize:28,marginBottom:6}}>📁</div>
         <div style={{fontSize:14,fontWeight:600,marginBottom:3}}>Arraste as plantas aqui</div>
-        <div style={{fontSize:12,color:"#9ca3af",marginBottom:14}}>PDF do CAD (ARQ, ELE, HID, PLU, INC, HVAC...) — carregue todas e clique em Orçar</div>
+        <div style={{fontSize:12,color:"#9ca3af",marginBottom:14}}>PDF ou <strong>DXF do AutoCAD</strong> (ARQ, ELE, HID, PLU, INC...) — DXF fornece medição exata de camadas e blocos</div>
         <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
           <button onClick={e=>{e.stopPropagation();fileRef.current?.click();}} style={{...S.btn,fontSize:12,padding:"7px 16px"}}>📄 Selecionar arquivos</button>
           <button onClick={e=>{e.stopPropagation();folderRef.current?.click();}} style={{...S.btn,fontSize:12,padding:"7px 16px"}}>📂 Selecionar pasta</button>
         </div>
-        <input ref={fileRef} type="file" multiple accept=".pdf,image/*" style={{display:"none"}} onChange={e=>carregarArquivos(e.target.files)}/>
-        <input ref={folderRef} type="file" multiple accept=".pdf,image/*" style={{display:"none"}}
+        <input ref={fileRef} type="file" multiple accept=".pdf,.dxf,image/*" style={{display:"none"}} onChange={e=>carregarArquivos(e.target.files)}/>
+        <input ref={folderRef} type="file" multiple accept=".pdf,.dxf,image/*" style={{display:"none"}}
           {...{webkitdirectory:"",directory:""}}
           onChange={e=>{
             const pdfs = Array.from(e.target.files).filter(f=>f.type==="application/pdf"||f.type.startsWith("image/"));
@@ -1412,6 +1615,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
                       {p.escala&&<span style={{fontSize:11,color:"#9ca3af"}}>escala {p.escala}</span>}
                       <span style={{fontSize:11,color:nItens===0?"#dc2626":"#9ca3af"}}>{nItens} itens{nItens>0?` · ${nPreco} cotados`:""}</span>
                       {total>0&&<span style={{fontSize:11,color:"#059669",fontWeight:600}}>{fmtR(total)}</span>}
+                      {p.tipo_fonte==="DXF"&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:"#dbeafe",color:"#1e40af",border:"1px solid #93c5fd",fontWeight:600}}>DXF</span>}
                       {p.consistencia?.tipo==="aviso"&&<span style={{fontSize:11,color:"#b45309",background:"#fef3c7",padding:"1px 7px",borderRadius:20,border:"1px solid #fcd34d"}} title={p.consistencia.msg}>⚠ aço/concreto</span>}
                       {p.consistencia?.tipo==="ok"&&<span style={{fontSize:11,color:"#065f46",background:"#d1fae5",padding:"1px 7px",borderRadius:20,border:"1px solid #6ee7b7"}} title={p.consistencia.msg}>✓ estrutura ok</span>}
                       {(p.itens||[]).filter(i=>i.corrigido_ia).length>0&&<span style={{fontSize:11,color:"#059669",background:"#f0fdf4",padding:"1px 7px",borderRadius:20,border:"1px solid #bbf7d0"}}>🔧 {(p.itens||[]).filter(i=>i.corrigido_ia).length} corrigido{(p.itens||[]).filter(i=>i.corrigido_ia).length!==1?"s":""}</span>}
@@ -1455,9 +1659,12 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
   const itensExcl   = itens.filter(i=>i.fora_escopo);
   let filtrados     = filtro==="Todos"?itensEscopo:itensEscopo.filter(i=>i.fonte===filtro);
   filtrados         = filtroConf==="Todos"?filtrados:filtrados.filter(i=>(i.confianca||"media")===filtroConf);
+  const temMercado   = itensEscopo.some(i=>i.preco_mercado && i.preco_mercado !== i.preco_sinapi);
   const comPreco    = itensEscopo.filter(i=>i.preco_sinapi);
   const totalSemBdi = comPreco.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
   const totalComBdi = totalSemBdi*(1+bdi/100);
+  const totalMercado= comPreco.reduce((s,i)=>s+(i.preco_mercado||i.preco_sinapi||0)*(i.qtd||0),0);
+  const totalMercBdi= totalMercado*(1+bdi/100);
   const cobertura   = itensEscopo.length?Math.round((comPreco.length/itensEscopo.length)*100):0;
   const col         = DISC_COR[planta.disciplina]||{};
   const nUnInvalidas = itensEscopo.filter(i=>i.un_valida===false).length;
@@ -1518,8 +1725,12 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
           {label:"Conf. baixa",valor:nBaixa,cor:nBaixa>0?"#b45309":"#059669",hint:"Itens estimados por escala/inferência"},
           {label:"UN inválida",valor:nUnInvalidas,cor:nUnInvalidas>0?"#dc2626":"#059669",hint:"Unidade do item ≠ unidade SINAPI"},
           {label:"Fora do escopo",valor:itensExcl.length,cor:itensExcl.length>0?"#6b7280":"#059669",hint:"Executados por terceiros — excluídos do total"},
-          {label:"Total sem BDI",valor:fmtR(totalSemBdi),cor:"#059669"},
-          {label:`Com BDI ${bdi}%`,valor:fmtR(totalComBdi),cor:"#059669"},
+          {label:"Total SINAPI",valor:fmtR(totalSemBdi),cor:"#059669"},
+          {label:`SINAPI c/ BDI ${bdi}%`,valor:fmtR(totalComBdi),cor:"#059669"},
+          ...(temMercado?[
+            {label:"Total mercado",valor:fmtR(totalMercado),cor:"#7c3aed",hint:"Preços de mercado (fatores por categoria)"},
+            {label:`Mercado c/ BDI ${bdi}%`,valor:fmtR(totalMercBdi),cor:"#7c3aed"},
+          ]:[]),
         ].map(c=>(
           <div key={c.label} title={c.hint||""} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:10,padding:"11px 14px",cursor:c.hint?"help":"default"}}>
             <div style={{fontSize:11,color:"#6b7280",marginBottom:3}}>{c.label}</div>
