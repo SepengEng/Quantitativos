@@ -182,19 +182,24 @@ INSTRUÇÕES DE ORÇAMENTISTA PROFISSIONAL:
 6. Para cada item, sugira o código SINAPI Bahia Não Desonerado mais preciso
 
 HIERARQUIA DE PRANCHAS — REGRA FUNDAMENTAL:
-Cada conjunto de pranchas de uma disciplina tem TIPOS diferentes. Só extraia quantidades do TIPO correto:
-▶ PLANTA BAIXA (plan view): FONTE PRIMÁRIA — extraia aqui todas as quantidades
-▶ CORTE / ELEVAÇÃO / FACHADA: fonte SECUNDÁRIA — só extraia o que NÃO aparece na planta (ex: alturas de pé-direito)
-▶ DETALHE (detail sheet): NÃO extraia quantidades — mostra COMO construir, não QUANTOS existem. Elementos do detalhe já estão contabilizados na planta
-▶ MEMÓRIA DE CÁLCULO / RELATÓRIO: NÃO extraia quantidades — documento de referência técnica apenas
-▶ ISOMÉTRICO / VISTA 3D: NÃO extraia — perspectiva do que já está na planta
+Ao processar UMA prancha individualmente, identifique o tipo dela e extraia APENAS os elementos que essa prancha é responsável por mostrar:
+▶ PLANTA BAIXA (plan view): FONTE PRIMÁRIA — extraia todas as quantidades visíveis NESTA PRANCHA
+▶ CORTE / ELEVAÇÃO: extraia só o que NÃO está na planta (alturas, espessuras) — NÃO re-extraia elementos que a planta já cobre
+▶ FACHADA: NÃO extraia quantidades — confirma existência, não gera medição própria
+▶ SUB-DETALHE DENTRO DA PRANCHA (ex: "Detalhe 1", "Modelo 1"): NÃO extraia — mostra como construir UM exemplo típico, os elementos já estão contados na vista principal da mesma prancha
+▶ MEMÓRIA DE CÁLCULO / RELATÓRIO (arquivo CM-...): NÃO extraia quantidades — só referência técnica
 
-REGRA ANTI-DUPLICAÇÃO — OBRIGATÓRIA:
-- Cada elemento físico deve aparecer UMA ÚNICA VEZ no JSON, independente de quantas pranchas o mostrem
-- Um conjunto de pranchas (ex: CE2-001 + CE2-002 + CE2-003) mostra O MESMO EDIFÍCIO em níveis/vistas diferentes — não some volumes entre elas
-- Planta de cobertura + Planta de piso + Fachadas: todos mostram o mesmo sistema de drenagem — extraia apenas da planta principal
-- Itens com mesma localização e mesma natureza (ex: "Canal de concreto - Perímetro") NÃO devem se repetir
-- Ao processar PDF com múltiplas pranchas: consolide elementos do mesmo tipo em UM único item com quantidade total
+REGRA ANTI-DUPLICAÇÃO — SOMENTE DENTRO DESTA PRANCHA:
+- Dentro desta prancha, cada elemento físico deve aparecer UMA ÚNICA VEZ no JSON
+- Se um pilar aparece na vista em planta E no corte transversal DENTRO DO MESMO PDF: conte só uma vez (pela planta)
+- Se esta prancha tem uma "vista principal" (planta) e sub-detalhes: extraia da vista principal, ignore os sub-detalhes
+- CADA PRANCHA É PROCESSADA ISOLADAMENTE — não se preocupe com o que outras pranchas do mesmo projeto extraíram; o sistema pós-processa duplicatas automaticamente
+
+IMPORTANTE — EXTRAIA TUDO QUE ESTA PRANCHA MOSTRA:
+- Cada prancha de um projeto tem responsabilidade sobre elementos específicos
+- CE2-001 = pilares → extraia pilares; CE2-002 = vigas → extraia vigas; CE2-003 = vigas cobertura → extraia vigas cobertura
+- DN5-001 = cobertura (áreas de contribuição) → extraia; DN5-002 = piso (calhas/tubulações) → extraia itens do piso
+- NUNCA retorne lista vazia para uma planta baixa com elementos visíveis, mesmo que outros PDFs do projeto existam
 
 REGRAS DE ESCALA — CRÍTICO:
 - Confirme a escala indicada no cabeçalho (ex: 1:50, 1:100, 1:150, 1:200)
@@ -240,9 +245,13 @@ ${BASE}`,
 "Estrutura":`Especialista em estruturas de concreto armado e fundações (NBR 6118/6122).
 
 TIPO DE PRANCHA — REGRAS CRÍTICAS:
-▶ CE = Concreto Estrutural. Um conjunto de pranchas CE (ex: CE2-001, CE2-002, CE2-003) mostra O MESMO EDIFÍCIO em cortes de nível diferentes (pilares, vigas do 1º pavimento, vigas de cobertura). NÃO some volumes entre pranchas do mesmo conjunto.
-▶ FD = Fundação. Prancha separada das vigas/pilares. Extraia sapatas e vigas de fundação SOMENTE da planta FD.
-▶ DETALHE DE ARMAÇÃO: NÃO extraia volumes — as dimensões da seção transversal do detalhe servem para calcular volume da peça listada na planta.
+▶ CE = Concreto Estrutural. Cada prancha CE tem elementos DISTINTOS — extraia tudo o que ela mostra:
+   • CE-001 (Posicionamento de Pilares): extraia PILARES — seção, quantidade, altura
+   • CE-002 (Vigas 1º Pavimento): extraia VIGAS DO 1º PAVIMENTO — tipo, comprimento, seção
+   • CE-003 (Vigas de Cobertura): extraia VIGAS DA COBERTURA — tipo, comprimento, seção
+   • NÃO pule uma prancha porque "já extraiu estrutura de outra CE" — cada CE trata elementos diferentes
+▶ FD = Fundação. Extraia daqui: sapatas isoladas (por tipo da tabela), vigas de fundação/baldrame, blocos de coroamento
+▶ SUB-DETALHE dentro de uma prancha CE (ex: "MODELO 1 DA MARQUISE", "SEÇÃO TRANSVERSAL KZ1"): use só para confirmar dimensões, NÃO conte como item adicional — o elemento já está na vista principal da prancha
 
 ESCOPO SEPENG — MUITO IMPORTANTE:
 ✅ INCLUIR: Concreto (m³), Formas (m²), Escavação de fundação (m³)
@@ -302,11 +311,11 @@ ${BASE}`,
 
 "Pluvial":`Especialista em drenagem pluvial/águas pluviais (NBR 10844).
 
-TIPO DE PRANCHA — REGRAS CRÍTICAS:
-▶ PLANTA DE COBERTURA (DNS-001): leia áreas de contribuição e posição das descidas — calcule ø das tubulações
-▶ PLANTA DE PISO (DNS-002): FONTE PRINCIPAL — extraia aqui o comprimento das calhas e tubulações no nível do solo
-▶ FACHADAS/CORTES (DNS-003): NÃO extraia — mostram as mesmas calhas do piso em outra vista
-▶ DETALHES (DNS-004): NÃO extraia quantidades — mostram COMO construir a caixa/calha, não quantas existem
+TIPO DE PRANCHA — REGRAS (cada prancha tem elementos distintos, extraia o que ELA mostra):
+▶ PLANTA DE COBERTURA (DN-001): extraia → áreas de contribuição por zona (m²), posição e quantidade de descidas/ralos de cobertura, diâmetro de calhas de cobertura. NÃO extraia calhas de piso daqui.
+▶ PLANTA DE PISO (DN-002): extraia → comprimento de calhas a nível do solo (m), tubulações subterrâneas (m por diâmetro), caixas coletoras (un). NÃO reextraia as descidas de cobertura já extraídas da planta de cobertura.
+▶ FACHADAS/CORTES (DN-003): NÃO extraia — mostram as mesmas calhas do piso em elevação, sem quantidades novas
+▶ DETALHES (DN-004): NÃO extraia — mostram como construir UM exemplar típico de caixa/calha; use só para confirmar dimensões da seção
 
 COMO MEDIR:
 - CALHAS EM CONCRETO: meça comprimento linear total das calhas no PISO pelo trajeto na planta. A seção vem dos detalhes. NÃO some calha do piso + calha da fachada + calha do detalhe (são a mesma).
