@@ -940,29 +940,68 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
     setVerificacaoGeral(null);
   };
 
-  const pdfParaImagens = (file)=>new Promise((resolve,reject)=>{
-    const go=()=>{
-      const lib=window.pdfjsLib;
-      lib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-      const url=URL.createObjectURL(file);
-      lib.getDocument(url).promise.then(async pdf=>{
-        const imgs=[];
-        for(let i=1;i<=pdf.numPages;i++){
-          const page=await pdf.getPage(i);
-          const vp=page.getViewport({scale:2.2});
-          const canvas=document.createElement("canvas");
-          canvas.width=vp.width;canvas.height=vp.height;
-          await page.render({canvasContext:canvas.getContext("2d"),viewport:vp}).promise;
-          imgs.push({base64:canvas.toDataURL("image/jpeg",0.92).split(",")[1],type:"image/jpeg"});
+  // Renderiza PDF em alta resolução e divide em tiles para melhor leitura pelo Gemini
+  // Plantas A1 (1:100-1:200) têm anotações muito pequenas — scale 3.0 garante legibilidade
+  const pdfParaImagensTiles = async (file, onProgress) => {
+    // Dynamic import do pdfjs-dist instalado (evita problemas SSR com Next.js)
+    const pdfjsLib = await import("pdfjs-dist");
+    // Worker via CDN correspondente à versão instalada
+    const ver = pdfjsLib.version || "5.7.284";
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      `https://cdn.jsdelivr.net/npm/pdfjs-dist@${ver}/build/pdf.worker.min.mjs`;
+
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+    const tiles = [];
+    const SCALE      = 3.0;   // 3× = ~216 DPI — cotas de plantas A1 ficam legíveis
+    const TILE_MAX   = 3200;  // máx pixels por dimensão antes de dividir em tiles
+    const OVERLAP    = 0.08;  // 8% de sobreposição entre tiles vizinhos
+
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      onProgress?.(`Renderizando página ${pageNum}/${pdf.numPages} em alta resolução...`);
+      const page = await pdf.getPage(pageNum);
+      const vp   = page.getViewport({ scale: SCALE });
+
+      const canvas = document.createElement("canvas");
+      canvas.width  = vp.width;
+      canvas.height = vp.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+
+      const W = canvas.width;
+      const H = canvas.height;
+      const cols = Math.min(2, Math.ceil(W / TILE_MAX)); // máx 2 colunas
+      const rows = Math.min(2, Math.ceil(H / TILE_MAX)); // máx 2 linhas → máx 4 tiles/pág
+
+      if (cols === 1 && rows === 1) {
+        // Página pequena: envia inteira
+        tiles.push({
+          base64: canvas.toDataURL("image/jpeg", 0.93).split(",")[1],
+          type: "image/jpeg",
+          _tileLabel: `pág.${pageNum}`,
+        });
+      } else {
+        // Divide em grid com sobreposição para não cortar elementos nas bordas
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            const sx = Math.max(0, Math.floor(c * W / cols - W * OVERLAP / 2));
+            const sy = Math.max(0, Math.floor(r * H / rows - H * OVERLAP / 2));
+            const sw = Math.min(Math.ceil(W / cols * (1 + OVERLAP)), W - sx);
+            const sh = Math.min(Math.ceil(H / rows * (1 + OVERLAP)), H - sy);
+            const tc  = document.createElement("canvas");
+            tc.width  = sw; tc.height = sh;
+            tc.getContext("2d").drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+            tiles.push({
+              base64: tc.toDataURL("image/jpeg", 0.93).split(",")[1],
+              type: "image/jpeg",
+              _tileLabel: `pág.${pageNum} seção ${r * cols + c + 1}/${rows * cols}`,
+            });
+          }
         }
-        URL.revokeObjectURL(url);resolve(imgs);
-      }).catch(reject);
-    };
-    if(window.pdfjsLib)return go();
-    const s=document.createElement("script");
-    s.src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-    s.onload=go;s.onerror=reject;document.head.appendChild(s);
-  });
+      }
+    }
+    return tiles;
+  };
 
   // Carregar arquivos (sem analisar ainda)
   const carregarArquivos = async(files)=>{
@@ -976,19 +1015,27 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         let imgs=[];
         let progDesc="";
         if(file.type==="application/pdf"){
-          const tamanhoMB=(file.size/1024/1024).toFixed(1);
-          if(file.size > 3_000_000){
-            // PDF grande: upload direto para Gemini File API (contorna limite 4,5 MB Vercel)
-            const {fileUri, mimeType} = await uploadParaGeminiFileAPI(file,
+          // Renderiza em alta resolução (3×) e divide em tiles para Gemini ler cotas pequenas
+          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Renderizando em alta resolução..."}:x));
+          try {
+            imgs = await pdfParaImagensTiles(file,
               (msg) => setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
             );
-            imgs=[{fileUri, type:mimeType}];
-            progDesc=`PDF completo · ${tamanhoMB} MB (via File API)`;
-          } else {
-            // PDF pequeno: base64 inline (mais rápido, sem roundtrip extra)
-            const base64=await toB64(file);
-            imgs=[{base64,type:"application/pdf"}];
-            progDesc=`PDF completo · ${tamanhoMB} MB`;
+            progDesc = `${imgs.length} tile${imgs.length>1?"s":""} alta res.`;
+          } catch (renderErr) {
+            console.warn("[PDF tiles] falhou, enviando PDF bruto como fallback:", renderErr);
+            // Fallback: envia como PDF bruto caso pdfjs-dist falhe
+            const tamanhoMB=(file.size/1024/1024).toFixed(1);
+            if(file.size > 3_000_000){
+              const {fileUri, mimeType} = await uploadParaGeminiFileAPI(file,
+                (msg) => setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
+              );
+              imgs=[{fileUri, type:mimeType}];
+              progDesc=`PDF bruto · ${tamanhoMB} MB`;
+            } else {
+              imgs=[{base64:await toB64(file),type:"application/pdf"}];
+              progDesc=`PDF bruto · ${tamanhoMB} MB`;
+            }
           }
         } else if(file.type.startsWith("image/")){
           imgs=[{base64:await toB64(file),type:file.type}];
@@ -1019,22 +1066,32 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const obraCtx       = montarObraCtx(obra, plantasExist);
         const prompt        = getPrompt(pend.disciplina, obraCtx, pend.nome || "");
         const todosItens=[];let ultimoParsed=null;
-        const isPDF=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
-        for(let i=0;i<pend.imgs.length;i++){
-          // Delay de 4s entre páginas para respeitar limite free do Gemini (20 req/min)
+        const isPDFBruto=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
+        const nTiles=pend.imgs.length;
+        for(let i=0;i<nTiles;i++){
+          // Delay entre tiles/páginas para respeitar rate limit Gemini (20 RPM)
           if(i>0) await new Promise(r=>setTimeout(r,4000));
-          const pgMsg=isPDF?`IA lendo PDF completo${pend.disciplina?` · ${pend.disciplina}`:""}...`:`IA analisando pág. ${i+1}/${pend.imgs.length}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
-          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
           const img=pend.imgs[i];
+          const tileLabel=img._tileLabel||`imagem ${i+1}/${nTiles}`;
+          const pgMsg=`IA lendo ${tileLabel}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
           const imgSource=img.fileUri
             ?{type:"file",  media_type:img.type, fileUri:img.fileUri}
             :{type:"base64",media_type:img.type, data:img.base64};
-          const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:isPDF?65536:32768,system:prompt,
+          // Texto de instrução varia por tipo: PDF bruto, tile parcial, ou imagem completa
+          let userText;
+          if(isPDFBruto){
+            userText=`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos e retorne um único JSON consolidado.`;
+          } else if(nTiles>1){
+            const discLabel = pend.disciplina ? ` (${pend.disciplina})` : "";
+            userText=`Esta é a ${tileLabel} da prancha "${pend.fileName}"${discLabel}. Imagem renderizada em alta resolução (3×). Leia TODAS as cotas, anotações e contagens visíveis nesta seção e extraia os itens correspondentes. Cada seção pode ter elementos únicos — extraia tudo que for visível.`;
+          } else {
+            userText=`Analise esta prancha${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Imagem em alta resolução — leia todas as cotas e anotações.`;
+          }
+          const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:32768,system:prompt,
             messages:[{role:"user",content:[
               {type:"image",source:imgSource},
-              {type:"text",text:isPDF
-                ?`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos de TODAS as pranchas e retorne um único JSON consolidado.`
-                :`Analise esta planta${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}${pend.imgs.length>1?` (pág.${i+1}/${pend.imgs.length})`:""}`}
+              {type:"text",text:userText}
             ]}]
           });
           // Throttle: garante intervalo mínimo de 3.5s entre requisições (≤17 RPM global)

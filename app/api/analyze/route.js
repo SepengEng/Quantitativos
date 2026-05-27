@@ -1,11 +1,11 @@
-// Modelos em ordem de qualidade — cada um tem quota separada de 20 RPM
+// Modelos Gemini em ordem de qualidade — cada um tem quota separada de 20 RPM
 const MODELOS = [
-  "gemini-2.5-flash",
-  "gemini-3.5-flash",
-  "gemini-3.1-flash-lite",
-  "gemini-2.5-flash-lite",
-  "gemini-3-flash-preview",
-  "gemini-flash-latest",
+  "gemini-2.5-flash",           // Best vision + reasoning for technical drawings
+  "gemini-2.5-flash-lite",      // Fallback: faster/cheaper 2.5 variant
+  "gemini-2.0-flash",           // Stable fallback
+  "gemini-1.5-pro",             // Legacy Pro: excellent vision
+  "gemini-1.5-flash",           // Legacy Flash: fast
+  "gemini-2.0-flash-lite",      // Last resort
 ];
 
 async function chamarGemini(geminiBody, apiKey) {
