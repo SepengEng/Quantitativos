@@ -1409,20 +1409,26 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       canvas.height = vp.height;
       await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
 
+      // Extrai camada de texto do PDF (cotas, notas, especificações) para injetar no prompt
+      let pdfText = "";
+      try {
+        const tc = await page.getTextContent();
+        pdfText = tc.items.map(i => i.str).filter(s => s.trim()).join(" ").slice(0, 4000);
+      } catch {}
+
       const W = canvas.width;
       const H = canvas.height;
       const cols = Math.min(2, Math.ceil(W / TILE_MAX)); // máx 2 colunas
       const rows = Math.min(2, Math.ceil(H / TILE_MAX)); // máx 2 linhas → máx 4 tiles/pág
 
       if (cols === 1 && rows === 1) {
-        // Página pequena: envia inteira
         tiles.push({
           base64: canvas.toDataURL("image/jpeg", 0.93).split(",")[1],
           type: "image/jpeg",
           _tileLabel: `pág.${pageNum}`,
+          _pdfText: pdfText,
         });
       } else {
-        // Divide em grid com sobreposição para não cortar elementos nas bordas
         for (let r = 0; r < rows; r++) {
           for (let c = 0; c < cols; c++) {
             const sx = Math.max(0, Math.floor(c * W / cols - W * OVERLAP / 2));
@@ -1436,6 +1442,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
               base64: tc.toDataURL("image/jpeg", 0.93).split(",")[1],
               type: "image/jpeg",
               _tileLabel: `pág.${pageNum} seção ${r * cols + c + 1}/${rows * cols}`,
+              _pdfText: pdfText, // mesmo texto para todos os tiles da mesma página
             });
           }
         }
@@ -1755,6 +1762,15 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             userText=`Esta é a ${tileLabel} da prancha "${pend.fileName}"${discLabel}. Imagem renderizada em alta resolução (3×). Leia TODAS as cotas, anotações e contagens visíveis nesta seção e extraia os itens correspondentes. Cada seção pode ter elementos únicos — extraia tudo que for visível.`;
           } else {
             userText=`Analise esta prancha${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Imagem em alta resolução — leia todas as cotas e anotações.`;
+          }
+          // Injeta texto extraído do PDF (cotas exatas, notas) — melhora leitura de dimensões pequenas
+          if(img._pdfText && img._pdfText.length > 20){
+            userText += `\n\nTEXTO EXTRAÍDO AUTOMATICAMENTE DO PDF (use para confirmar cotas e especificações — priorize sobre estimativas visuais):\n${img._pdfText}`;
+          }
+          // Contexto anti-duplicata: informa à IA o que as seções anteriores já extraíram
+          if(i > 0 && todosItens.length > 0){
+            const resumoAnterior = todosItens.slice(-15).map(it=>`${it.descricao} (${it.qtd} ${it.un})`).join("; ");
+            userText += `\n\nITENS JÁ EXTRAÍDOS NAS SEÇÕES ANTERIORES DESTA PRANCHA — NÃO DUPLICAR:\n${resumoAnterior}\nSe um elemento já aparece acima, ignore-o completamente nesta seção.`;
           }
           const reqBody=JSON.stringify({model:"gemini-2.5-flash",max_tokens:32768,system:prompt,
             messages:[{role:"user",content:[
@@ -2124,12 +2140,29 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
   const [bdi,setBdi]               = useState(25);
   const [verificando,setVerificando] = useState(false);
   const [verificacao,setVerificacao] = useState(null);
+  const [editando,setEditando]     = useState(null); // {origIdx, campo}
+  const [editVal,setEditVal]       = useState("");
 
   const itens       = planta.itens||[];
-  const itensEscopo = itens.filter(i=>!i.fora_escopo);
+  // Preserva índice original para edição inline
+  const itensEscopo = itens.map((i,idx)=>({...i,_origIdx:idx})).filter(i=>!i.fora_escopo);
   const itensExcl   = itens.filter(i=>i.fora_escopo);
   let filtrados     = filtro==="Todos"?itensEscopo:itensEscopo.filter(i=>i.fonte===filtro);
   filtrados         = filtroConf==="Todos"?filtrados:filtrados.filter(i=>(i.confianca||"media")===filtroConf);
+
+  const salvarEdicao = (origIdx, campo, valor) => {
+    setObras(prev => prev.map(o => {
+      if (o.id !== obra.id) return o;
+      return { ...o, plantas: o.plantas.map(p => {
+        if (p.id !== planta.id) return p;
+        const novos = [...p.itens];
+        const novoVal = campo === "qtd" ? (parseFloat(valor) || novos[origIdx].qtd) : valor;
+        novos[origIdx] = { ...novos[origIdx], [campo]: novoVal, confianca: "alta" };
+        return { ...p, itens: novos };
+      })};
+    }));
+    setEditando(null);
+  };
   const temMercado   = itensEscopo.some(i=>i.preco_mercado && i.preco_mercado !== i.preco_sinapi);
   const comPreco    = itensEscopo.filter(i=>i.preco_sinapi);
   const totalSemBdi = comPreco.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
@@ -2263,12 +2296,34 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
                 return (
                   <tr key={j} style={{background:j%2===0?"#fff":"#fafafa",borderBottom:"1px solid #f3f4f6"}}>
                     <td style={{...S.td,fontFamily:"monospace",fontSize:10,color:"#9ca3af",whiteSpace:"nowrap"}}>{it.codigo_item}</td>
-                    <td style={{...S.td,lineHeight:1.4,minWidth:200}}>{it.descricao}</td>
-                    <td style={{...S.td,textAlign:"center"}}>
-                      <span style={{color:unOk===false?"#dc2626":"#374151"}} title={unOk===false?`UN item "${it.un}" ≠ SINAPI "${it.un_sinapi}"`:unOk===true?`Unidade validada com SINAPI ${it.un_sinapi}`:""}>{it.un}</span>
-                      {unOk===false&&<span style={{fontSize:9,marginLeft:2,color:"#dc2626"}}>⚠</span>}
+                    {/* Descrição — duplo-clique para editar */}
+                    <td style={{...S.td,lineHeight:1.4,minWidth:200,cursor:"text"}} onDoubleClick={()=>{setEditando({origIdx:it._origIdx,campo:"descricao"});setEditVal(it.descricao||"");}}>
+                      {editando?.origIdx===it._origIdx&&editando.campo==="descricao"
+                        ?<input autoFocus value={editVal} onChange={e=>setEditVal(e.target.value)}
+                            onBlur={()=>salvarEdicao(it._origIdx,"descricao",editVal)}
+                            onKeyDown={e=>{if(e.key==="Enter")salvarEdicao(it._origIdx,"descricao",editVal);if(e.key==="Escape")setEditando(null);}}
+                            style={{width:"100%",fontSize:12,padding:"2px 4px",border:"2px solid #2563eb",borderRadius:4,outline:"none"}}/>
+                        :<span title="Duplo-clique para editar">{it.descricao}</span>}
                     </td>
-                    <td style={{...S.td,textAlign:"right",fontWeight:600}}>{fmt(it.qtd)}</td>
+                    {/* UN — duplo-clique para editar */}
+                    <td style={{...S.td,textAlign:"center",cursor:"text"}} onDoubleClick={()=>{setEditando({origIdx:it._origIdx,campo:"un"});setEditVal(it.un||"");}}>
+                      {editando?.origIdx===it._origIdx&&editando.campo==="un"
+                        ?<input autoFocus value={editVal} onChange={e=>setEditVal(e.target.value)}
+                            onBlur={()=>salvarEdicao(it._origIdx,"un",editVal)}
+                            onKeyDown={e=>{if(e.key==="Enter")salvarEdicao(it._origIdx,"un",editVal);if(e.key==="Escape")setEditando(null);}}
+                            style={{width:50,fontSize:12,padding:"2px 4px",border:"2px solid #2563eb",borderRadius:4,outline:"none",textAlign:"center"}}/>
+                        :<><span style={{color:unOk===false?"#dc2626":"#374151"}} title={unOk===false?`UN item "${it.un}" ≠ SINAPI "${it.un_sinapi}"`:unOk===true?`Unidade validada com SINAPI ${it.un_sinapi}`:""}>{it.un}</span>
+                          {unOk===false&&<span style={{fontSize:9,marginLeft:2,color:"#dc2626"}}>⚠</span>}</>}
+                    </td>
+                    {/* Quantidade — duplo-clique para editar */}
+                    <td style={{...S.td,textAlign:"right",fontWeight:600,cursor:"text"}} onDoubleClick={()=>{setEditando({origIdx:it._origIdx,campo:"qtd"});setEditVal(String(it.qtd||""));}}>
+                      {editando?.origIdx===it._origIdx&&editando.campo==="qtd"
+                        ?<input autoFocus value={editVal} onChange={e=>setEditVal(e.target.value)} type="number" step="any"
+                            onBlur={()=>salvarEdicao(it._origIdx,"qtd",editVal)}
+                            onKeyDown={e=>{if(e.key==="Enter")salvarEdicao(it._origIdx,"qtd",editVal);if(e.key==="Escape")setEditando(null);}}
+                            style={{width:70,fontSize:12,padding:"2px 4px",border:"2px solid #2563eb",borderRadius:4,outline:"none",textAlign:"right"}}/>
+                        :<span title="Duplo-clique para editar">{fmt(it.qtd)}</span>}
+                    </td>
                     <td style={{...S.td,whiteSpace:"nowrap"}}><span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:cs.bg,color:cs.color}}>{cs.label}</span></td>
                     <td style={{...S.td,whiteSpace:"nowrap"}}><span style={{fontSize:10,padding:"2px 7px",borderRadius:20,background:fb.bg,color:fb.color}}>{it.fonte}</span></td>
                     <td style={{...S.td,fontFamily:"monospace",fontSize:11,color:it.sinapi_sugerido?"#2563eb":"#d1d5db",whiteSpace:"nowrap"}}>{it.sinapi_sugerido||"—"}</td>
