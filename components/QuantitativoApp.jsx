@@ -153,41 +153,22 @@ async function resolverPrecosBatch(itens) {
   return { precoMap, unMap, fonteMap };
 }
 
-// ─── UPLOAD DIRETO PARA GEMINI FILE API (contorna limite 4,5 MB do Vercel) ───
-// PDFs grandes são enviados direto para o Google; o servidor recebe só a URI.
-async function uploadParaGeminiFileAPI(file, onStatus) {
-  const apiKey = process.env.NEXT_PUBLIC_GEMINI_API_KEY;
-  if (!apiKey) throw new Error("NEXT_PUBLIC_GEMINI_API_KEY não configurada");
-
-  onStatus?.(`Enviando ${(file.size/1024/1024).toFixed(1)} MB para Gemini...`);
+// ─── UPLOAD PARA CLAUDE FILES API (contorna limite 4,5 MB do Vercel) ────────
+// PDFs grandes são enviados para o servidor que os repassa à Anthropic Files API.
+async function uploadParaClaudeFilesAPI(file, onStatus) {
+  onStatus?.(`Enviando ${(file.size/1024/1024).toFixed(1)} MB para Claude...`);
 
   const form = new FormData();
   form.append("file", file, file.name);
 
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${apiKey}`,
-    { method: "POST", body: form }
-  );
+  const resp = await fetch("/api/upload", { method: "POST", body: form });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({}));
-    throw new Error(`Upload Gemini: ${err.error?.message || resp.status}`);
+    throw new Error(`Upload falhou: ${err.error || resp.status}`);
   }
   const data = await resp.json();
-  const fileUri  = data.file?.uri;
-  const fileName = data.file?.name; // "files/abc123"
-  if (!fileUri) throw new Error("Gemini não retornou URI do arquivo");
-
-  // Aguarda estado ACTIVE (PDFs ficam ativos quase imediatamente)
-  for (let i = 0; i < 8; i++) {
-    const st = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${apiKey}`
-    ).then(r => r.json()).catch(() => ({}));
-    if (!st.state || st.state === "ACTIVE") break;
-    onStatus?.(`Processando arquivo... (${i+1}/8)`);
-    await new Promise(r => setTimeout(r, 2000));
-  }
-
-  return { fileUri, mimeType: data.file?.mimeType || file.type };
+  if (!data.file_id) throw new Error("Servidor não retornou file_id");
+  return { file_id: data.file_id, mimeType: file.type };
 }
 
 // ─── DETECÇÃO DE DISCIPLINA ───────────────────────────────────────────────────
@@ -1275,7 +1256,6 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   const [nAplicadas,setNAplicadas]   = useState(0);
   const fileRef   = useRef();
   const folderRef = useRef();
-  const ultimaRequisicao = useRef(0);
   const cliente = clientes.find(c=>c.id===obra.clienteId);
   const atualizar = (fn)=>setObras(p=>p.map(o=>o.id===obra.id?fn(o):o));
   const obraAtual = obras.find(o=>o.id===obra.id);
@@ -1642,10 +1622,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             console.warn("[PDF tiles] falhou, enviando PDF bruto como fallback:", renderErr);
             const tamanhoMB=(file.size/1024/1024).toFixed(1);
             if(file.size > 3_000_000){
-              const {fileUri, mimeType} = await uploadParaGeminiFileAPI(file,
+              const {file_id, mimeType} = await uploadParaClaudeFilesAPI(file,
                 (msg) => setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
               );
-              imgs=[{fileUri, type:mimeType}];
+              imgs=[{file_id, type:mimeType}];
               progDesc=`PDF bruto · ${tamanhoMB} MB`;
             } else {
               imgs=[{base64:await toB64(file),type:"application/pdf"}];
@@ -1665,24 +1645,20 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
     }
   };
 
-  // Orçar tudo — analisar todas as pendentes
+  // Analisar todas as pendentes — até 3 plantas em paralelo (sem throttle, Claude API)
   const orcaTudo = async()=>{
     const prontas=pendentes.filter(p=>p.status==="pronto");
     if(!prontas.length)return;
     setOrcando(true);setErro("");
 
-    for(let pi=0;pi<prontas.length;pi++){
-      const pend=prontas[pi];
-      // Delay de 4s entre plantas (exceto a primeira) para respeitar rate limit do Gemini free
-      if(pi>0) await new Promise(r=>setTimeout(r,4000));
-      // Skip entire discipline if out of scope (e.g. EstruturaMet is always another company)
+    const processarPlanta = async (pend) => {
       const DISC_SEMPRE_EXCLUIDAS = new Set(["EstruturaMet", "Especificação"]);
       if (DISC_SEMPRE_EXCLUIDAS.has(pend.disciplina)) {
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"ignorado",
           progresso:`⚠️ ${pend.disciplina} — fora do escopo (executada por terceiros)`}:x));
-        continue;
+        return;
       }
-      setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"analisando",progresso:"IA analisando..."}:x));
+      setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"analisando",progresso:"Claude analisando..."}:x));
       try{
         const obraAtualSnap = obras.find(o => o.id === obra.id);
         const plantasExist  = (obraAtualSnap?.plantas || []).filter(p => p.itens?.length > 0);
@@ -1690,42 +1666,34 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
 
         // ── Branch DXF: 2 fases — geometria determinística + IA só faz SINAPI ──
         if(pend.dxfData){
-          // Fase 1 (instantânea): interpreta layers → elementos com quantidades exatas
           setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Calculando quantidades do CAD..."}:x));
           const elementos = interpretarLayersDXF(pend.dxfData, obra);
           if(elementos.length === 0){
-            // Fallback: manda dados brutos para IA interpretar (layers não reconhecidos)
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"IA interpretando layers desconhecidos..."}:x));
           } else {
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`${elementos.length} elementos calculados → buscando SINAPI...`}:x));
           }
-
-          // Fase 2 (IA leve): prompt compacto — IA só resolve código SINAPI + preço
           const dxfPrompt = elementos.length > 0
             ? getDxfSinapiPrompt(elementos, pend.disciplina, obraCtx)
-            : getDxfPrompt(pend.disciplina, obraCtx, pend.dxfData); // fallback
+            : getDxfPrompt(pend.disciplina, obraCtx, pend.dxfData);
           const dxfUserText = elementos.length > 0
             ? `DXF: "${pend.fileName}" · ${elementos.length} elementos pré-calculados.\nAtribua código SINAPI BA a cada item.`
             : `Arquivo DXF: "${pend.fileName}" · Disciplina: ${pend.disciplina||"a identificar"}\nResumo: ${pend.dxfData.resumo.total_layers} layers · ${pend.dxfData.resumo.total_comprimento_m}m · ${pend.dxfData.resumo.total_blocos} blocos.\nQuantifique todos os elementos.`;
-          const agora=Date.now();
-          const espThrottle=3500-(agora-ultimaRequisicao.current);
-          if(espThrottle>0) await new Promise(r=>setTimeout(r,espThrottle));
-          ultimaRequisicao.current=Date.now();
           const reqBodyDxf=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:32768,system:dxfPrompt,
             messages:[{role:"user",content:[{type:"text",text:dxfUserText}]}]});
-          let dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
-          for(let rt=0;rt<8&&dataDxf.error?.type==="rate_limit";rt++){
-            const espera=(dataDxf.error.retryAfter||30)*1000;
+          const chamarDxf=async()=>{
+            const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf});
+            try{ return await resp.json(); }
+            catch{ return {error:{type:"parse_error",message:`HTTP ${resp.status}`}}; }
+          };
+          let dataDxf=await chamarDxf();
+          for(let rt=0;rt<5&&dataDxf.error?.type==="rate_limit";rt++){
+            const espera=(dataDxf.error.retryAfter||20)*1000;
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s...`}:x));
             await new Promise(r=>setTimeout(r,espera));
-            dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
+            dataDxf=await chamarDxf();
           }
-          for(let rt=0;rt<3&&dataDxf.error?.type==="gemini_error";rt++){
-            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Erro Gemini, aguardando 10s (tentativa ${rt+2}/4)...`}:x));
-            await new Promise(r=>setTimeout(r,10000));
-            dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
-          }
-          if(dataDxf.error) throw new Error(`Gemini: ${dataDxf.error.message||dataDxf.error.type}`);
+          if(dataDxf.error) throw new Error(`Claude: ${dataDxf.error.message||dataDxf.error.type}`);
           const dxfText=dataDxf.content?.find(b=>b.type==="text")?.text||"{}";
           const dxfClean=dxfText.replace(/```json[\s\S]*?```|```[\s\S]*?```/g,m=>m.replace(/```json|```/g,"")).replace(/```json|```/g,"").trim();
           let parsedDxf={itens:[]};
@@ -1744,7 +1712,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             return{...it,sinapi_sugerido:codigoFinal,sinapi_descricao:it._sinapi_real?.descricao||it.sinapi_descricao,
               preco_sinapi:precoBase,preco_mercado:precoMercado,un_sinapi:unSinapi,
               un_valida:unCompativel(it.un,unSinapi),
-              confianca:it.confianca||"alta", // DXF = sempre alta confiança (dados exatos)
+              confianca:it.confianca||"alta",
               fora_escopo:itemForaDoEscopo(it,escopo_excluir),fonte:it.fonte||"📐 Cota",
               _dxf:true};
           });
@@ -1759,7 +1727,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"concluido",
             progresso:itensEnriquecidos.length===0?`⚠️ 0 itens DXF — verifique layers`:
             `✅ ${itensEnriquecidos.length} itens [DXF] · ${fmtR(totalValor)}`}:x));
-          continue; // pula o branch de imagem
+          return;
         }
 
         const prompt        = getPrompt(pend.disciplina, obraCtx, pend.fileName || "");
@@ -1767,16 +1735,12 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const isPDFBruto=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
         const nTiles=pend.imgs.length;
         for(let i=0;i<nTiles;i++){
-          // Delay entre tiles/páginas para respeitar rate limit Gemini (20 RPM)
-          if(i>0) await new Promise(r=>setTimeout(r,4000));
           const img=pend.imgs[i];
           const tileLabel=img._tileLabel||`imagem ${i+1}/${nTiles}`;
-          const pgMsg=`IA lendo ${tileLabel}${pend.disciplina?` · ${pend.disciplina}`:""}...`;
-          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:pgMsg}:x));
-          const imgSource=img.fileUri
-            ?{type:"file",  media_type:img.type, fileUri:img.fileUri}
-            :{type:"base64",media_type:img.type, data:img.base64};
-          // Texto de instrução varia por tipo: PDF bruto, tile parcial, ou imagem completa
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`Claude lendo ${tileLabel}${pend.disciplina?` · ${pend.disciplina}`:""}...`}:x));
+          const imgSource = img.file_id
+            ? { type:"file", file_id:img.file_id }
+            : { type:"base64", media_type:img.type, data:img.base64 };
           let userText;
           if(isPDFBruto){
             userText=`Analise TODAS as páginas/pranchas deste PDF de engenharia${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Extraia todos os quantitativos e retorne um único JSON consolidado.`;
@@ -1792,56 +1756,39 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
               {type:"text",text:userText}
             ]}]
           });
-          // Throttle: garante intervalo mínimo de 3.5s entre requisições (≤17 RPM global)
-          const agora=Date.now();
-          const espThrottle=3500-(agora-ultimaRequisicao.current);
-          if(espThrottle>0) await new Promise(r=>setTimeout(r,espThrottle));
-          ultimaRequisicao.current=Date.now();
           const chamar=async()=>{
-            ultimaRequisicao.current=Date.now();
             const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
             if(resp.status===413) return {error:{type:"file_too_large",message:"PDF muito grande (>4,5 MB). Tente comprimir ou dividir o arquivo."}};
             try{ return await resp.json(); }
             catch{ return {error:{type:"parse_error",message:`Resposta inesperada do servidor (HTTP ${resp.status})`}}; }
           };
           let data=await chamar();
-          // Rate limit — retenta até 8x esperando o tempo sugerido
-          for(let rt=0;rt<8&&data.error?.type==="rate_limit";rt++){
-            const espera=(data.error.retryAfter||30)*1000;
-            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/8)...`}:x));
+          for(let rt=0;rt<5&&data.error?.type==="rate_limit";rt++){
+            const espera=(data.error.retryAfter||20)*1000;
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/5)...`}:x));
             await new Promise(r=>setTimeout(r,espera));
             data=await chamar();
           }
-          // Transient Gemini error (500) — retry up to 3x with 10s delay
-          for(let rt=0;rt<3&&data.error?.type==="gemini_error";rt++){
-            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Erro Gemini, aguardando 10s (tentativa ${rt+2}/4)...`}:x));
-            await new Promise(r=>setTimeout(r,10000));
-            data=await chamar();
-          }
           if(data.error){
-            throw new Error(`Gemini API: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
+            throw new Error(`Claude: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
           }
           if(!data.content){
             throw new Error(`Resposta inesperada da API: ${JSON.stringify(data).slice(0,200)}`);
           }
           const text=data.content?.find(b=>b.type==="text")?.text||"{}";
           const finishReason=data.finishReason||"";
-          console.log(`[IA pág.${i+1}] finishReason=${finishReason} len=${text.length} início:`, text.slice(0,300));
+          console.log(`[Claude pág.${i+1}] finishReason=${finishReason} len=${text.length} início:`, text.slice(0,300));
           let parsed={itens:[]};
           try{
-            // Remove markdown fences mantendo o conteúdo
             const clean=text.replace(/```json[\s\S]*?```|```[\s\S]*?```/g, m=>m.replace(/```json|```/g,"")).replace(/```json|```/g,"").trim();
-            // Tenta extrair o maior bloco JSON válido
             const jsonMatch=clean.match(/\{[\s\S]*\}/);
             if(jsonMatch){
               try{
                 parsed=JSON.parse(jsonMatch[0]);
               }catch{
-                // JSON truncado (MAX_TOKENS) — tenta recuperar itens já completos
                 const itensMatch=jsonMatch[0].match(/"itens"\s*:\s*\[([\s\S]*)/);
                 if(itensMatch){
                   const itensStr=itensMatch[1];
-                  // Encontra objetos completos de item
                   const itemRegex=/\{[^{}]*(?:"[^"]*"[^{}]*)*\}/g;
                   const partialItens=[];
                   let m;
@@ -1862,10 +1809,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           todosItens.push(...(parsed.itens||[]));
           ultimoParsed=parsed;
         }
-        // Deduplica itens antes de enriquecer (remove elementos contados múltiplas vezes)
         const itensDedup = deduplicarItens(todosItens);
-
-        // Buscar preços SINAPI + UNs para validação
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Buscando preços SINAPI..."}:x));
         const { precoMap, unMap } = await resolverPrecosBatch(itensDedup);
         const disciplinaFinal = ultimoParsed?.disciplina || pend.disciplina;
@@ -1914,9 +1858,14 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       } catch(e){
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"erro",progresso:"Erro: "+e.message}:x));
       }
-    }
+    };
+
+    // Processa até 3 plantas simultaneamente (workers disputam a mesma fila)
+    const queue=[...prontas];
+    const worker=async()=>{ let p; while((p=queue.shift())) await processarPlanta(p); };
+    await Promise.all(Array.from({length:Math.min(3,prontas.length)},worker));
+
     setOrcando(false);
-    // Limpar as concluídas após 15s (tempo para ler debug de 0 itens)
     setTimeout(()=>setPendentes(p=>p.filter(x=>x.status!=="concluido"&&x.status!=="erro")),15000);
   };
 

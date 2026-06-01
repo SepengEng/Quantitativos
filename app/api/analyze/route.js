@@ -1,105 +1,86 @@
-// Modelos Gemini em ordem de qualidade — cada um tem quota separada de 20 RPM
-const MODELOS = [
-  "gemini-2.5-flash",           // Best vision + reasoning for technical drawings
-  "gemini-2.5-flash-lite",      // Fallback: faster/cheaper 2.5 variant
-  "gemini-2.0-flash",           // Stable fallback
-  "gemini-1.5-pro",             // Legacy Pro: excellent vision
-  "gemini-1.5-flash",           // Legacy Flash: fast
-  "gemini-2.0-flash-lite",      // Last resort
-];
+import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "fs";
+import { join } from "path";
 
-async function chamarGemini(geminiBody, apiKey) {
-  let lastError = null;
-  let anyRateLimit = false;
+function getApiKey() {
+  if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
+  // Fallback: lê .env.local diretamente (necessário quando Claude Code zera a env var no bash)
+  try {
+    const content = readFileSync(join(process.cwd(), ".env.local"), "utf8");
+    const m = content.match(/^ANTHROPIC_API_KEY=(.+)$/m);
+    if (m?.[1]) return m[1].trim();
+  } catch {}
+  return null;
+}
 
-  for (const modelo of MODELOS) {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(geminiBody),
-      }
-    );
-    const data = await response.json();
+function convertBlock(block) {
+  if (block.type !== "image") return block;
+  const src = block.source || {};
 
-    if (data.error) {
-      lastError = data.error;
-      const isRL = data.error.code === 429 || data.error.status === "RESOURCE_EXHAUSTED";
-      if (isRL) anyRateLimit = true;
-      console.log(`[Gemini] ${modelo} erro ${data.error.code || data.error.status || "?"} — próximo modelo`);
-      continue;
-    }
-
-    console.log(`[Gemini] modelo: ${modelo} | finish: ${data.candidates?.[0]?.finishReason}`);
-    return data;
+  // Anthropic Files API (file_id)
+  if (src.file_id) {
+    return { type: "document", source: { type: "file", file_id: src.file_id } };
   }
 
-  // Todos os modelos falharam
-  const msg = lastError?.message || "Todos os modelos Gemini falharam";
-  if (anyRateLimit) {
-    const retryMatch = msg.match(/retry.*?(\d+(?:\.\d+)?)s/i);
-    const retryAfter = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) + 2 : 30;
-    return { error: { code: 429, type: "rate_limit", message: msg, retryAfter } };
+  // Gemini fileUri — não suportado mais
+  if (src.fileUri) {
+    throw new Error("Arquivo carregado via Gemini não suportado. Recarregue o PDF.");
   }
-  return { error: { code: lastError?.code || 500, type: "gemini_error", message: msg } };
+
+  // PDF como documento, imagens como imagem
+  if (src.media_type === "application/pdf") {
+    return { type: "document", source: { type: "base64", media_type: "application/pdf", data: src.data } };
+  }
+
+  return block;
 }
 
 export async function POST(request) {
-  const body = await request.json();
-  const apiKey = process.env.GEMINI_API_KEY;
-
+  const apiKey = getApiKey();
   if (!apiKey) {
     return Response.json(
-      { type: "error", error: { type: "config_error", message: "GEMINI_API_KEY não configurada no servidor" } },
+      { type: "error", error: { type: "config_error", message: "ANTHROPIC_API_KEY não configurada" } },
       { status: 500 }
     );
   }
 
-  const parts = [];
-  for (const msg of body.messages || []) {
-    const content = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }];
-    for (const block of content) {
-      if (block.type === "image") {
-        if (block.source.fileUri) {
-          // Arquivo grande carregado via Gemini File API
-          parts.push({ file_data: { mime_type: block.source.media_type, file_uri: block.source.fileUri } });
-        } else {
-          parts.push({ inline_data: { mime_type: block.source.media_type, data: block.source.data } });
-        }
-      } else if (block.type === "text") {
-        parts.push({ text: block.text });
-      }
+  const body = await request.json();
+
+  try {
+    const client = new Anthropic({ apiKey });
+    const messages = (body.messages || []).map(msg => ({
+      role: msg.role,
+      content: (Array.isArray(msg.content) ? msg.content : [{ type: "text", text: msg.content }])
+        .map(convertBlock),
+    }));
+
+    const response = await client.messages.create({
+      model: body.model || "claude-sonnet-4-6",
+      max_tokens: body.max_tokens || 32768,
+      system: body.system,
+      messages,
+    });
+
+    const text = response.content?.find(b => b.type === "text")?.text || "{}";
+    console.log(`[Claude] model=${response.model} stop=${response.stop_reason} len=${text.length}`);
+
+    return Response.json({
+      content: [{ type: "text", text }],
+      finishReason: response.stop_reason,
+    });
+  } catch (err) {
+    console.error("[Claude] error:", err.status, err.message);
+
+    if (err.status === 429 || err.status === 529) {
+      return Response.json({
+        type: "error",
+        error: { type: "rate_limit", message: err.message, retryAfter: 20 },
+      });
     }
-  }
 
-  const geminiBody = {
-    systemInstruction: body.system ? { parts: [{ text: body.system }] } : undefined,
-    contents: [{ role: "user", parts }],
-    generationConfig: { maxOutputTokens: body.max_tokens || 32768 },
-  };
-
-  const data = await chamarGemini(geminiBody, apiKey);
-
-  if (data.error) {
-    const isRateLimit = data.error.code === 429 || data.error.type === "rate_limit";
     return Response.json({
       type: "error",
-      error: {
-        type: isRateLimit ? "rate_limit" : "gemini_error",
-        message: data.error.message,
-        retryAfter: data.error.retryAfter || 30,
-      }
+      error: { type: "claude_error", message: err.message || String(err) },
     });
   }
-
-  const candidate = data.candidates?.[0];
-  const finishReason = candidate?.finishReason || "UNKNOWN";
-  const respParts = candidate?.content?.parts || [];
-  const textPart = respParts.find(p => p.text && !p.thought) || respParts.find(p => p.text);
-  const text = textPart?.text || "{}";
-
-  console.log(`[Gemini] finishReason=${finishReason} textLen=${text.length}`);
-
-  return Response.json({ content: [{ type: "text", text }], finishReason });
 }
