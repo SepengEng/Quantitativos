@@ -117,10 +117,245 @@ function style(row, { bg, bold = false, fs = 9.5, fc = C.texto, h = 16 } = {}) {
   });
 }
 
+// ════════════════════════════════════════════════════════════════════════════════
+// MODO QUANTITATIVO — formato limpo sem MO, foco em precisão de levantamento
+// ════════════════════════════════════════════════════════════════════════════════
+async function gerarQuantitativo(obra, incluirPreco) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Quantitativos IA — Sepeng Engenharia";
+  wb.created = new Date();
+
+  const plantas = obra.plantas || [];
+  const grupos  = {};
+  for (const p of plantas) {
+    const d = p.disciplina || "Sem disciplina";
+    if (!grupos[d]) grupos[d] = [];
+    grupos[d].push(p);
+  }
+
+  // ── Paleta de confiança
+  const C_CONF = {
+    alta:  { bg: "FFD1FAE5", txt: "FF065F46", badge: "✅ Alta" },
+    media: { bg: "FFFEF3C7", txt: "FF92400E", badge: "⚠️ Média" },
+    baixa: { bg: "FFFEE2E2", txt: "FF991B1B", badge: "❌ Baixa" },
+  };
+  const confColor = (c) => C_CONF[c?.toLowerCase()] || C_CONF.media;
+
+  // ── Aba "Resumo"
+  const wsRes = wb.addWorksheet("Resumo");
+  wsRes.columns = [
+    { width: 5  },
+    { width: 22 }, // Disciplina
+    { width: 10 }, // Qtd itens
+    { width: 10 }, // Alta
+    { width: 10 }, // Média
+    { width: 10 }, // Baixa
+    { width: 16 }, // Valor total (opcional)
+  ];
+
+  // Cabeçalho Resumo
+  const rr1 = wsRes.addRow([]);
+  wsRes.mergeCells(`A1:G1`);
+  wsRes.getRow(1).height = 36;
+  Object.assign(wsRes.getCell("A1"), {
+    value: `LEVANTAMENTO DE QUANTITATIVOS — ${(obra.nome||"").toUpperCase()}`,
+    font: { bold: true, size: 15, color: { argb: "FFFFFFFF" } },
+    fill: { type: "pattern", pattern: "solid", fgColor: { argb: "FF1B2A3B" } },
+    alignment: { vertical: "middle", horizontal: "center" },
+  });
+
+  const rr2 = wsRes.addRow([]);
+  wsRes.mergeCells(`A2:G2`);
+  wsRes.getRow(2).height = 18;
+  wsRes.getCell("A2").value = `Data: ${new Date().toLocaleDateString("pt-BR")}  ·  ${plantas.length} planta(s) analisada(s)${incluirPreco ? "  ·  Preços referência: SINAPI BA / Arqmedes" : ""}`;
+  wsRes.getCell("A2").font  = { italic: true, size: 10, color: { argb: "FF6B7280" } };
+  wsRes.getCell("A2").alignment = { horizontal: "center", vertical: "middle" };
+
+  const rr3 = wsRes.addRow(["#", "Disciplina", "Itens", "Alta", "Média", "Baixa", ...(incluirPreco?["Valor Total"]:[] )]);
+  wsRes.getRow(3).height = 20;
+  wsRes.getRow(3).eachCell(c => {
+    c.font = { bold: true, size: 10, color: { argb: "FFFFFFFF" } };
+    c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0E7490" } };
+    c.alignment = { horizontal: "center", vertical: "middle" };
+  });
+
+  let discN = 1;
+  let grandTotal = 0;
+  for (const [disc, gplantas] of Object.entries(grupos)) {
+    const allItens = gplantas.flatMap(p => p.itens || []);
+    const alta  = allItens.filter(i => i.confianca === "alta").length;
+    const media = allItens.filter(i => i.confianca === "media").length;
+    const baixa = allItens.filter(i => !i.confianca || i.confianca === "baixa").length;
+    const total = incluirPreco ? allItens.reduce((s,i) => s + num(i.preco_sinapi)*num(i.qtd), 0) : null;
+    if (incluirPreco) grandTotal += total;
+    const rowData = [discN, disc, allItens.length, alta, media, baixa, ...(incluirPreco?[total]:[])];
+    const rDisc = wsRes.addRow(rowData);
+    rDisc.height = 17;
+    rDisc.eachCell(c => c.font = { size: 10 });
+    if (incluirPreco && total != null) { rDisc.getCell(7).numFmt = "#,##0.00"; rDisc.getCell(7).alignment = { horizontal: "right" }; }
+    [4,5,6].forEach((col, ci) => {
+      const vals = [alta, media, baixa];
+      if (vals[ci] > 0) {
+        const clr = [C_CONF.alta, C_CONF.media, C_CONF.baixa][ci];
+        rDisc.getCell(col).fill = { type: "pattern", pattern: "solid", fgColor: { argb: clr.bg.replace("FF","FF") } };
+        rDisc.getCell(col).font = { size: 10, color: { argb: clr.txt } };
+      }
+    });
+    discN++;
+  }
+
+  if (incluirPreco && grandTotal > 0) {
+    wsRes.addRow([]);
+    const rGT = wsRes.addRow(["", "TOTAL GERAL", "", "", "", "", grandTotal]);
+    rGT.height = 22;
+    rGT.eachCell(c => {
+      c.font = { bold: true, size: 12 };
+      c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD1FAE5" } };
+    });
+    rGT.getCell(7).numFmt = "#,##0.00";
+    rGT.getCell(7).alignment = { horizontal: "right" };
+    wsRes.mergeCells(rGT.number, 1, rGT.number, 6);
+  }
+
+  // ── Uma aba por disciplina
+  for (const [disc, gplantas] of Object.entries(grupos)) {
+    const sheetName = disc.replace(/[\/\\?\*\[\]:]/g, "_").slice(0, 31);
+    const ws = wb.addWorksheet(sheetName);
+
+    const baseCols = [
+      { width: 5  }, // #
+      { width: 30 }, // Localização
+      { width: 50 }, // Descrição
+      { width: 8  }, // UN
+      { width: 12 }, // Qtd
+      { width: 11 }, // Confiança
+      { width: 36 }, // Obs
+    ];
+    if (incluirPreco) baseCols.push({ width: 14 }, { width: 16 });
+    ws.columns = baseCols;
+
+    // Cabeçalho da aba
+    ws.addRow([]);
+    ws.getRow(1).height = 32;
+    ws.mergeCells(1, 1, 1, incluirPreco ? 9 : 7);
+    Object.assign(ws.getCell("A1"), {
+      value: `${disc.toUpperCase()} — ${obra.nome || ""}`,
+      font:  { bold: true, size: 14, color: { argb: "FFFFFFFF" } },
+      fill:  { type: "pattern", pattern: "solid", fgColor: { argb: "FF1B2A3B" } },
+      alignment: { vertical: "middle", horizontal: "left" },
+    });
+    ws.getCell("A1").alignment = { vertical: "middle", horizontal: "left", indent: 1 };
+
+    const headers = ["#", "Localização", "Descrição do Serviço", "UN", "Quantidade", "Confiança", "Observação", ...(incluirPreco ? ["Preço Unit.", "Total (R$)"] : [])];
+    const rH = ws.addRow(headers);
+    rH.height = 20;
+    rH.eachCell(c => {
+      c.font = { bold: true, size: 10, color: { argb: "FFFFFFFF" } };
+      c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0E7490" } };
+      c.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+    });
+    ws.views = [{ state: "frozen", ySplit: 2 }];
+
+    // Itens
+    let n = 1;
+    for (const planta of gplantas) {
+      // Separador de arquivo
+      const rFile = ws.addRow([`📄 ${planta.fileName || "Planta"}`, "", "", "", "", "", `${(planta.itens||[]).length} itens · ${planta.escala || ""}`, ...(incluirPreco?["",""]:[])]);
+      ws.mergeCells(rFile.number, 2, rFile.number, incluirPreco ? 9 : 7);
+      rFile.height = 16;
+      rFile.eachCell(c => {
+        c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF1F5F9" } };
+        c.font = { bold: true, size: 9, color: { argb: "FF475569" } };
+        c.alignment = { vertical: "middle" };
+      });
+
+      for (const item of planta.itens || []) {
+        const conf    = (item.confianca || "media").toLowerCase();
+        const cClr    = confColor(conf);
+        const qtd     = num(item.qtd);
+        const preco   = num(item.preco_sinapi);
+        const total   = preco * qtd;
+        const rowData = [
+          n,
+          item.localizacao || "",
+          item.descricao   || "",
+          item.un          || "",
+          qtd              || "",
+          cClr.badge,
+          item.obs         || item.fonte || "",
+          ...(incluirPreco ? [preco || "", total || ""] : []),
+        ];
+        const rItem = ws.addRow(rowData);
+        rItem.height = 15;
+
+        // Cor da linha baseada na confiança
+        rItem.eachCell({ includeEmpty: true }, c => {
+          c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: cClr.bg } };
+          c.font = { size: 9.5 };
+          c.alignment = { vertical: "middle", wrapText: false };
+        });
+        rItem.getCell(1).font  = { size: 9,   color: { argb: "FF9CA3AF" } };
+        rItem.getCell(3).font  = { size: 9.5, bold: false };
+        rItem.getCell(5).font  = { size: 9.5, bold: true };
+        rItem.getCell(5).alignment = { horizontal: "right", vertical: "middle" };
+        rItem.getCell(6).font  = { size: 9,   color: { argb: cClr.txt } };
+        rItem.getCell(7).font  = { size: 8.5, italic: true, color: { argb: "FF6B7280" } };
+        if (incluirPreco) {
+          rItem.getCell(8).numFmt    = "#,##0.00";
+          rItem.getCell(8).alignment = { horizontal: "right", vertical: "middle" };
+          rItem.getCell(9).numFmt    = "#,##0.00";
+          rItem.getCell(9).alignment = { horizontal: "right", vertical: "middle" };
+          rItem.getCell(9).font      = { size: 9.5, bold: true };
+        }
+        n++;
+      }
+    }
+
+    // Totais da aba
+    const todosItens = gplantas.flatMap(p => p.itens || []);
+    ws.addRow([]);
+    const totCols = incluirPreco
+      ? ["", `${n-1} itens`, "", "", "", "", "", "", todosItens.reduce((s,i)=>s+num(i.preco_sinapi)*num(i.qtd),0)]
+      : ["", `${n-1} itens`, "", "", "", "", ""];
+    const rTot = ws.addRow(totCols);
+    rTot.height = 18;
+    rTot.eachCell(c => {
+      c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF9FAFB" } };
+      c.font = { bold: true, size: 10 };
+      c.alignment = { vertical: "middle" };
+    });
+    if (incluirPreco) {
+      rTot.getCell(9).numFmt    = "#,##0.00";
+      rTot.getCell(9).alignment = { horizontal: "right", vertical: "middle" };
+    }
+
+    // Legenda de confiança
+    ws.addRow([]);
+    const rLeg = ws.addRow(["", "LEGENDA:", "✅ Alta = cota ou contagem direta", "⚠️ Média = calculado de cotas", "❌ Baixa = estimado/inferido — revisar", "", ""]);
+    rLeg.height = 14;
+    rLeg.eachCell(c => {
+      c.font      = { size: 8, italic: true, color: { argb: "FF9CA3AF" } };
+      c.alignment = { vertical: "middle" };
+    });
+  }
+
+  const buf  = await wb.xlsx.writeBuffer();
+  const nome = `QTD_${(obra.nome||"Obra").replace(/[^a-zA-Z0-9]/g,"_").slice(0,30)}_${new Date().toISOString().slice(0,10)}.xlsx`;
+  return new Response(buf, {
+    headers: {
+      "Content-Type":        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${nome}"`,
+    },
+  });
+}
+
 // ── Handler principal ──────────────────────────────────────────────────────────
 export async function POST(request) {
-  const { obra, bdi = 25 } = await request.json();
+  const { obra, bdi = 25, modo = "quantitativo", incluirPreco = false } = await request.json();
   if (!obra) return Response.json({ error: "Obra não informada" }, { status: 400 });
+
+  // Modo quantitativo (padrão) — formato limpo sem MO
+  if (modo === "quantitativo") return gerarQuantitativo(obra, incluirPreco);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = "Quantitativos IA — Sepeng Engenharia";

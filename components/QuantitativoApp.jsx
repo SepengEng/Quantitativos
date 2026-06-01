@@ -1026,7 +1026,7 @@ export default function QuantitativoApp() {
       <div style={{width:220,background:"#111",color:"#fff",padding:"24px 0",display:"flex",flexDirection:"column",flexShrink:0,position:"sticky",top:0,height:"100vh"}}>
         <div style={{padding:"0 20px 20px",borderBottom:"1px solid #222"}}>
           <div style={{fontSize:15,fontWeight:800,marginBottom:2}}>Quantitativos IA</div>
-          <div style={{fontSize:11,color:"#6b7280"}}>Medição · Orçamento · SINAPI</div>
+          <div style={{fontSize:11,color:"#6b7280"}}>Levantamento · Medição · Excel</div>
           {sinapiRef&&<div style={{fontSize:10,color:"#22c55e",marginTop:4}}>● SINAPI BA {sinapiRef}</div>}
           {arqMeta?.totalItens>0
             ? <div style={{fontSize:10,color:"#f59e0b",marginTop:2}}>★ Arqmedes {arqMeta.totalItens} itens</div>
@@ -1132,7 +1132,7 @@ function SecaoObras({obras,setObras,clientes}) {
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24}}>
         <div>
           <h1 style={{fontSize:22,fontWeight:700,marginBottom:4}}>Obras</h1>
-          <p style={{fontSize:13,color:"#6b7280"}}>Carregue todas as plantas e clique em <strong>Orçar</strong> — a IA processa tudo de uma vez.</p>
+          <p style={{fontSize:13,color:"#6b7280"}}>Carregue as plantas e clique em <strong>Levantar</strong> — a IA extrai todos os quantitativos. Em seguida, exporte o Excel de levantamento.</p>
         </div>
         <button onClick={()=>setShowForm(true)} style={S.btnPrimary}>+ Nova obra</button>
       </div>
@@ -1904,11 +1904,12 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           analisadoEm:new Date().toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"}),
         };
         atualizar(o=>({...o,plantas:[...(o.plantas||[]),novaPlanta]}));
-        const totalValor=itensEnriquecidos.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0);
+        const nAlta=itensEnriquecidos.filter(i=>i.confianca==="alta").length;
+        const nBaixaMsg=itensEnriquecidos.filter(i=>i.confianca==="baixa").length;
         const ultimoFinish=ultimoParsed?._finishReason||"";
         const progMsg=itensEnriquecidos.length===0
           ?`⚠️ 0 itens${ultimoFinish?` [${ultimoFinish}]`:""} — IA: "${(ultimoParsed?.resumo||ultimoParsed?.disciplina||"sem conteúdo detectado").slice(0,100)}"`
-          :`✅ ${itensEnriquecidos.length} itens · ${fmtR(totalValor)}`;
+          :`✅ ${itensEnriquecidos.length} itens · ${nAlta} alta${nBaixaMsg>0?` · ⚠️ ${nBaixaMsg} baixa`:""}`;
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"concluido",progresso:progMsg}:x));
       } catch(e){
         setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"erro",progresso:"Erro: "+e.message}:x));
@@ -2059,8 +2060,8 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             {prontas.length>0&&(
               <button onClick={orcaTudo} disabled={orcando} style={{...S.btnPrimary,padding:"8px 20px",fontSize:13,display:"flex",alignItems:"center",gap:8,opacity:orcando?0.7:1}}>
                 {orcando
-                  ? <><span style={{animation:"spin 1s linear infinite",display:"inline-block"}}>⚙️</span> Orçando...</>
-                  : <>💰 Orçar {prontas.length} planta{prontas.length!==1?"s":""}</>
+                  ? <><span style={{animation:"spin 1s linear infinite",display:"inline-block"}}>⚙️</span> Analisando...</>
+                  : <>📐 Levantar {prontas.length} planta{prontas.length!==1?"s":""}</>
                 }
               </button>
             )}
@@ -2097,8 +2098,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
             {plantas.map(p=>{
               const nItens=p.itens?.length||0;
-              const nPreco=p.itens?.filter(i=>i.preco_sinapi)?.length||0;
-              const total=p.itens?.reduce((s,i)=>s+(i.preco_sinapi||0)*(i.qtd||0),0)||0;
+              const nAlta=(p.itens||[]).filter(i=>i.confianca==="alta").length;
+              const nMedia=(p.itens||[]).filter(i=>!i.confianca||i.confianca==="media").length;
+              const nBaixa=(p.itens||[]).filter(i=>i.confianca==="baixa").length;
+              const pctAlta=nItens>0?Math.round((nAlta/nItens)*100):0;
               const col=DISC_COR[p.disciplina]||{};
               return (
                 <div key={p.id} onClick={()=>onOpenPlanta(p.id)} style={{...S.card,padding:14,display:"flex",alignItems:"center",gap:12,cursor:"pointer"}}
@@ -2110,16 +2113,24 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
                     <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
                       {p.disciplina&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:col.bg||"#f3f4f6",color:col.text||"#374151",border:`1px solid ${col.border||"#e5e7eb"}`}}>{p.disciplina}</span>}
                       {p.escala&&<span style={{fontSize:11,color:"#9ca3af"}}>escala {p.escala}</span>}
-                      <span style={{fontSize:11,color:nItens===0?"#dc2626":"#9ca3af"}}>{nItens} itens{nItens>0?` · ${nPreco} cotados`:""}</span>
-                      {total>0&&<span style={{fontSize:11,color:"#059669",fontWeight:600}}>{fmtR(total)}</span>}
+                      {nItens===0
+                        ? <span style={{fontSize:11,color:"#dc2626"}}>0 itens extraídos</span>
+                        : <>
+                            <span style={{fontSize:11,fontWeight:600,color:"#111"}}>{nItens} itens</span>
+                            {nAlta>0&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:"#d1fae5",color:"#065f46",border:"1px solid #6ee7b7"}}>✅ {nAlta} alta</span>}
+                            {nMedia>0&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:"#fef3c7",color:"#92400e",border:"1px solid #fde68a"}}>⚠️ {nMedia} média</span>}
+                            {nBaixa>0&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:"#fee2e2",color:"#991b1b",border:"1px solid #fecaca"}}>❌ {nBaixa} baixa</span>}
+                          </>
+                      }
                       {p.tipo_fonte==="DXF"&&<span style={{fontSize:10,padding:"1px 7px",borderRadius:20,background:"#dbeafe",color:"#1e40af",border:"1px solid #93c5fd",fontWeight:600}}>DXF</span>}
                       {p.consistencia?.tipo==="aviso"&&<span style={{fontSize:11,color:"#b45309",background:"#fef3c7",padding:"1px 7px",borderRadius:20,border:"1px solid #fcd34d"}} title={p.consistencia.msg}>⚠ aço/concreto</span>}
-                      {p.consistencia?.tipo==="ok"&&<span style={{fontSize:11,color:"#065f46",background:"#d1fae5",padding:"1px 7px",borderRadius:20,border:"1px solid #6ee7b7"}} title={p.consistencia.msg}>✓ estrutura ok</span>}
-                      {(p.itens||[]).filter(i=>i.corrigido_ia).length>0&&<span style={{fontSize:11,color:"#059669",background:"#f0fdf4",padding:"1px 7px",borderRadius:20,border:"1px solid #bbf7d0"}}>🔧 {(p.itens||[]).filter(i=>i.corrigido_ia).length} corrigido{(p.itens||[]).filter(i=>i.corrigido_ia).length!==1?"s":""}</span>}
+                      {(p.itens||[]).filter(i=>i.corrigido_ia).length>0&&<span style={{fontSize:11,color:"#059669",background:"#f0fdf4",padding:"1px 7px",borderRadius:20,border:"1px solid #bbf7d0"}}>🔧 {(p.itens||[]).filter(i=>i.corrigido_ia).length} corr.</span>}
                     </div>
                     {nItens===0&&p.resumo&&<div style={{fontSize:11,color:"#6b7280",marginTop:4,fontStyle:"italic"}}>IA: "{p.resumo.slice(0,120)}"</div>}
+                    {nItens>0&&nBaixa>0&&<div style={{fontSize:11,color:"#b45309",marginTop:3}}>⚠ {nBaixa} iten{nBaixa!==1?"s":""}  precisam de revisão manual — confiança baixa</div>}
                   </div>
-                  <div style={{display:"flex",gap:8,flexShrink:0}}>
+                  <div style={{display:"flex",gap:8,flexShrink:0,alignItems:"center"}}>
+                    {nItens>0&&<div style={{fontSize:12,fontWeight:700,color:pctAlta>=80?"#059669":pctAlta>=60?"#f59e0b":"#dc2626",background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:8,padding:"4px 10px",whiteSpace:"nowrap"}}>{pctAlta}% confiável</div>}
                     <button onClick={e=>{e.stopPropagation();if(confirm("Excluir?"))atualizar(o=>({...o,plantas:o.plantas.filter(x=>x.id!==p.id)}));}} style={{fontSize:12,color:"#dc2626",background:"none",border:"none",cursor:"pointer"}}>✕</button>
                   </div>
                 </div>
@@ -2217,17 +2228,12 @@ function VisualizadorPlanta({planta,obra,onBack,obras,setObras}) {
 
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:10,marginBottom:12}}>
         {[
-          {label:"Itens",valor:itens.length,cor:"#111"},
-          {label:"SINAPI cobertos",valor:`${cobertura}%`,cor:cobertura>=70?"#059669":"#f59e0b"},
-          {label:"Conf. baixa",valor:nBaixa,cor:nBaixa>0?"#b45309":"#059669",hint:"Itens estimados por escala/inferência"},
-          {label:"UN inválida",valor:nUnInvalidas,cor:nUnInvalidas>0?"#dc2626":"#059669",hint:"Unidade do item ≠ unidade SINAPI"},
-          {label:"Fora do escopo",valor:itensExcl.length,cor:itensExcl.length>0?"#6b7280":"#059669",hint:"Executados por terceiros — excluídos do total"},
-          {label:"Total SINAPI",valor:fmtR(totalSemBdi),cor:"#059669"},
-          {label:`SINAPI c/ BDI ${bdi}%`,valor:fmtR(totalComBdi),cor:"#059669"},
-          ...(temMercado?[
-            {label:"Total mercado",valor:fmtR(totalMercado),cor:"#7c3aed",hint:"Preços de mercado (fatores por categoria)"},
-            {label:`Mercado c/ BDI ${bdi}%`,valor:fmtR(totalMercBdi),cor:"#7c3aed"},
-          ]:[]),
+          {label:"Total de itens",valor:itensEscopo.length,cor:"#111"},
+          {label:"✅ Alta confiança",valor:itensEscopo.filter(i=>i.confianca==="alta").length,cor:"#065f46",hint:"Quantidade medida de cota explícita ou contagem direta"},
+          {label:"⚠️ Média confiança",valor:itensEscopo.filter(i=>!i.confianca||i.confianca==="media").length,cor:"#92400e",hint:"Calculado a partir de cotas — verificar"},
+          {label:"❌ Baixa / revisar",valor:nBaixa,cor:nBaixa>0?"#dc2626":"#059669",hint:"Estimado por escala ou inferência — revisar com atenção"},
+          {label:"Fora do escopo",valor:itensExcl.length,cor:itensExcl.length>0?"#6b7280":"#9ca3af",hint:"Executados por terceiros — excluídos do total"},
+          ...(totalSemBdi>0?[{label:"Preço ref. (SINAPI)",valor:fmtR(totalSemBdi),cor:"#6b7280",hint:"Valor de referência — use o Banco de Preços para sua tabela"}]:[]),
         ].map(c=>(
           <div key={c.label} title={c.hint||""} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:10,padding:"11px 14px",cursor:c.hint?"help":"default"}}>
             <div style={{fontSize:11,color:"#6b7280",marginBottom:3}}>{c.label}</div>
@@ -2414,19 +2420,43 @@ function SecaoSinapi() {
 
 // ─── ORÇAMENTO ────────────────────────────────────────────────────────────────
 function SecaoOrcamento({obras}) {
-  const [obraId,setObraId]       = useState("");
-  const [plantaId,setPlantaId]   = useState("");
-  const [bdi,setBdi]             = useState(25);
-  const [exportando,setExportando] = useState(false);
+  const [obraId,setObraId]         = useState("");
+  const [plantaId,setPlantaId]     = useState("");
+  const [bdi,setBdi]               = useState(25);
+  const [exportando,setExportando] = useState("");
+  const [incluirPreco,setIncluirPreco] = useState(false);
 
-  const exportarExcel = async (obraAlvo) => {
+  // Exporta Levantamento de Quantitativos (formato limpo, sem MO)
+  const exportarQuantitativo = async (obraAlvo) => {
     if (!obraAlvo || exportando) return;
-    setExportando(true);
+    setExportando("qtd");
     try {
       const resp = await fetch("/api/export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ obra: obraAlvo, bdi }),
+        body: JSON.stringify({ obra: obraAlvo, modo: "quantitativo", incluirPreco }),
+      });
+      if (!resp.ok) throw new Error(`Erro HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `QTD_${(obraAlvo.nome||"Obra").replace(/[^a-zA-Z0-9]/g,"_").slice(0,30)}_${new Date().toISOString().slice(0,10)}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch(e) { alert("Erro ao exportar: " + e.message); }
+    finally { setExportando(""); }
+  };
+
+  // Exporta Orçamento Executivo (formato MAT/MO completo)
+  const exportarExecutivo = async (obraAlvo) => {
+    if (!obraAlvo || exportando) return;
+    setExportando("exec");
+    try {
+      const resp = await fetch("/api/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ obra: obraAlvo, bdi, modo: "executivo" }),
       });
       if (!resp.ok) throw new Error(`Erro HTTP ${resp.status}`);
       const blob = await resp.blob();
@@ -2436,11 +2466,8 @@ function SecaoOrcamento({obras}) {
       a.download = `ORC_${(obraAlvo.nome||"Obra").replace(/[^a-zA-Z0-9]/g,"_").slice(0,30)}_BDI${bdi}.xlsx`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch(e) {
-      alert("Erro ao exportar: " + e.message);
-    } finally {
-      setExportando(false);
-    }
+    } catch(e) { alert("Erro ao exportar: " + e.message); }
+    finally { setExportando(""); }
   };
 
   const obra   = obras.find(o=>o.id===obraId);
@@ -2474,9 +2501,9 @@ function SecaoOrcamento({obras}) {
   return (
     <div>
       <h1 style={{fontSize:22,fontWeight:700,marginBottom:4}}>Orçamento</h1>
-      <p style={{fontSize:13,color:"#6b7280",marginBottom:24}}>Consolide o orçamento com preços SINAPI por obra e disciplina.</p>
+      <p style={{fontSize:13,color:"#6b7280",marginBottom:24}}>Gere o Excel de quantitativos da obra — levantamento limpo por disciplina, pronto para orçamentação.</p>
 
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr auto",gap:12,marginBottom:20,alignItems:"end"}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12,alignItems:"end"}}>
         <div><label style={S.label}>Obra</label>
           <select style={S.input} value={obraId} onChange={e=>{setObraId(e.target.value);setPlantaId("");}}>
             <option value="">Selecione uma obra</option>
@@ -2489,48 +2516,66 @@ function SecaoOrcamento({obras}) {
             {(obra?.plantas||[]).map(p=><option key={p.id} value={p.id}>{p.disciplina?`[${p.disciplina}] `:""}{p.fileName}</option>)}
           </select>
         </div>
-        <div><label style={S.label}>BDI %</label>
-          <input type="number" style={{...S.input,width:70}} value={bdi} onChange={e=>setBdi(Number(e.target.value))} min={0} max={100}/>
-        </div>
       </div>
+
+      {/* Opções de exportação */}
+      {obra&&(
+        <div style={{...S.card,padding:14,marginBottom:20,display:"flex",alignItems:"center",gap:16,flexWrap:"wrap"}}>
+          <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,cursor:"pointer",userSelect:"none"}}>
+            <input type="checkbox" checked={incluirPreco} onChange={e=>setIncluirPreco(e.target.checked)} style={{width:14,height:14}}/>
+            Incluir coluna de preços de referência (SINAPI / Arqmedes) no Excel
+          </label>
+          {incluirPreco&&(
+            <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12}}>
+              BDI:
+              <input type="number" style={{...S.input,width:60,padding:"4px 8px"}} value={bdi} onChange={e=>setBdi(Number(e.target.value))} min={0} max={100}/>
+              %
+            </label>
+          )}
+          <div style={{marginLeft:"auto",display:"flex",gap:8,flexWrap:"wrap"}}>
+            <button onClick={()=>exportarQuantitativo(obra)} disabled={!!exportando} style={{...S.btnPrimary,background:"#1d4ed8",opacity:exportando?0.6:1,fontSize:12,padding:"7px 16px"}}>
+              {exportando==="qtd"?"⏳ Gerando...":"📐 Levantamento (.xlsx)"}
+            </button>
+            <button onClick={()=>exportarExecutivo(obra)} disabled={!!exportando} title="Formato executivo completo com MAT/MO e encargos sociais" style={{...S.btn,fontSize:12,padding:"7px 14px",opacity:exportando?0.6:1}}>
+              {exportando==="exec"?"⏳ Gerando...":"↓ Orçamento Executivo"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Resumo da obra por disciplina */}
       {obra&&!plantaId&&Object.keys(resumoObra).length>0&&(
         <div style={{...S.card,overflow:"hidden",marginBottom:20}}>
           <div style={{padding:"12px 16px",borderBottom:"1px solid #e5e7eb",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
-            <span style={{fontSize:13,fontWeight:600}}>{obra.nome} — Resumo por disciplina</span>
-            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              {fatorMercado !== 1 && <span style={{fontSize:12,color:"#7c3aed",background:"#ede9fe",padding:"3px 10px",borderRadius:20}}>mercado {obra.fator_mercado}% SINAPI</span>}
-              <span style={{fontSize:14,fontWeight:700,color:"#059669"}}>{fmtR(totalObra*(1+bdi/100))} <span style={{fontSize:11,fontWeight:400,color:"#6b7280"}}>c/ BDI {bdi}%</span></span>
-              <button onClick={()=>exportarExcel(obra)} disabled={exportando} style={{...S.btnPrimary,padding:"6px 14px",fontSize:12,background:"#059669",opacity:exportando?0.6:1}}>
-                {exportando?"⏳ Gerando...":"↓ Excel (.xlsx)"}
-              </button>
-            </div>
+            <span style={{fontSize:13,fontWeight:600}}>{obra.nome} — Levantamento por disciplina</span>
+            {totalObra>0&&<span style={{fontSize:12,color:"#6b7280"}}>Preço ref.: {fmtR(totalObra)} <span style={{fontSize:10}}>sem BDI</span></span>}
           </div>
           <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
-            <thead><tr>{["Disciplina","Plantas","Itens","Total sem BDI",`Total c/BDI ${bdi}%`,fatorMercado!==1?"Mercado (est.)":""].filter(Boolean).map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <thead><tr>{["Disciplina","Plantas","Itens","✅ Alta","⚠️ Média","❌ Baixa"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
             <tbody>
               {Object.entries(resumoObra).map(([d,v],j)=>{
                 const col=DISC_COR[d]||{};
                 const nPlantas=(obra.plantas||[]).filter(p=>p.disciplina===d).length;
+                const allItens=(obra.plantas||[]).filter(p=>p.disciplina===d).flatMap(p=>p.itens||[]);
+                const nAlta=allItens.filter(i=>i.confianca==="alta").length;
+                const nMedia=allItens.filter(i=>i.confianca==="media"||!i.confianca).length;
+                const nBaixa=allItens.filter(i=>i.confianca==="baixa").length;
                 return (
                   <tr key={j} style={{background:j%2===0?"#fff":"#fafafa"}}>
                     <td style={S.td}><span style={{fontSize:11,padding:"2px 9px",borderRadius:20,background:col.bg||"#f3f4f6",color:col.text||"#374151",border:`1px solid ${col.border||"#e5e7eb"}`}}>{d}</span></td>
                     <td style={{...S.td,textAlign:"center"}}>{nPlantas}</td>
-                    <td style={{...S.td,textAlign:"center"}}>{v.itens}</td>
-                    <td style={{...S.td,textAlign:"right",fontWeight:600,color:"#059669"}}>{fmtR(v.total)}</td>
-                    <td style={{...S.td,textAlign:"right",fontWeight:700,color:"#047857"}}>{fmtR(v.total*(1+bdi/100))}</td>
-                    {fatorMercado!==1&&<td style={{...S.td,textAlign:"right",fontWeight:600,color:"#7c3aed"}}>{fmtR(v.total*fatorMercado*(1+bdi/100))}</td>}
+                    <td style={{...S.td,textAlign:"center",fontWeight:600}}>{v.itens}</td>
+                    <td style={{...S.td,textAlign:"center",color:"#065f46",fontWeight:600}}>{nAlta||"—"}</td>
+                    <td style={{...S.td,textAlign:"center",color:"#92400e"}}>{nMedia||"—"}</td>
+                    <td style={{...S.td,textAlign:"center",color:nBaixa>0?"#dc2626":"#9ca3af",fontWeight:nBaixa>0?700:400}}>{nBaixa||"—"}</td>
                   </tr>
                 );
               })}
-              <tr style={{background:"#f0fdf4",borderTop:"2px solid #e5e7eb"}}>
-                <td style={{...S.td,fontWeight:700}}>TOTAL OBRA</td>
+              <tr style={{background:"#f0f9ff",borderTop:"2px solid #e5e7eb"}}>
+                <td style={{...S.td,fontWeight:700}}>TOTAL</td>
                 <td style={{...S.td,textAlign:"center",fontWeight:600}}>{(obra.plantas||[]).length}</td>
-                <td style={{...S.td,textAlign:"center",fontWeight:600}}>{Object.values(resumoObra).reduce((s,v)=>s+v.itens,0)}</td>
-                <td style={{...S.td,textAlign:"right",fontWeight:700,color:"#059669",fontSize:13}}>{fmtR(totalObra)}</td>
-                <td style={{...S.td,textAlign:"right",fontWeight:800,color:"#047857",fontSize:15}}>{fmtR(totalObra*(1+bdi/100))}</td>
-                {fatorMercado!==1&&<td style={{...S.td,textAlign:"right",fontWeight:800,color:"#7c3aed",fontSize:15}}>{fmtR(totalObra*fatorMercado*(1+bdi/100))}</td>}
+                <td style={{...S.td,textAlign:"center",fontWeight:700,fontSize:13}}>{Object.values(resumoObra).reduce((s,v)=>s+v.itens,0)}</td>
+                <td colSpan={3} style={{...S.td,textAlign:"center",color:"#6b7280",fontSize:11}}>itens</td>
               </tr>
             </tbody>
           </table>
@@ -2540,18 +2585,23 @@ function SecaoOrcamento({obras}) {
       {planta&&(
         <>
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
-            {[{label:"Itens",valor:itens.length},{label:"Com preço",valor:`${comPreco.length}/${itens.length}`},{label:"Total sem BDI",valor:fmtR(totalSemBdi)},{label:`BDI ${bdi}%`,valor:fmtR(totalComBdi)}].map(c=>(
+            {[
+              {label:"Itens totais",valor:itens.length,cor:"#111"},
+              {label:"✅ Alta confiança",valor:itens.filter(i=>i.confianca==="alta").length,cor:"#065f46"},
+              {label:"⚠️ Média confiança",valor:itens.filter(i=>!i.confianca||i.confianca==="media").length,cor:"#92400e"},
+              {label:"❌ Baixa / revisar",valor:itens.filter(i=>i.confianca==="baixa").length,cor:"#dc2626"},
+            ].map(c=>(
               <div key={c.label} style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:10,padding:"12px 14px"}}>
                 <div style={{fontSize:11,color:"#6b7280",marginBottom:3}}>{c.label}</div>
-                <div style={{fontSize:18,fontWeight:700}}>{c.valor}</div>
+                <div style={{fontSize:18,fontWeight:700,color:c.cor}}>{c.valor}</div>
               </div>
             ))}
           </div>
           <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
             <div style={{display:"flex",gap:8}}>
               <button onClick={exportar} style={S.btn}>↓ CSV</button>
-              <button onClick={()=>exportarExcel(obra)} disabled={exportando} style={{...S.btnPrimary,background:"#059669",opacity:exportando?0.6:1}}>
-                {exportando?"⏳ Gerando...":"↓ Excel (.xlsx)"}
+              <button onClick={()=>exportarQuantitativo(obra)} disabled={!!exportando} style={{...S.btnPrimary,background:"#1d4ed8",opacity:exportando?0.6:1}}>
+                {exportando==="qtd"?"⏳ Gerando...":"📐 Levantamento (.xlsx)"}
               </button>
             </div>
           </div>
