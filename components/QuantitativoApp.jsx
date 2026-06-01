@@ -1256,6 +1256,7 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
   const [nAplicadas,setNAplicadas]   = useState(0);
   const fileRef   = useRef();
   const folderRef = useRef();
+  const ultimaRequisicao = useRef(0);
   const cliente = clientes.find(c=>c.id===obra.clienteId);
   const atualizar = (fn)=>setObras(p=>p.map(o=>o.id===obra.id?fn(o):o));
   const obraAtual = obras.find(o=>o.id===obra.id);
@@ -1679,21 +1680,24 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           const dxfUserText = elementos.length > 0
             ? `DXF: "${pend.fileName}" · ${elementos.length} elementos pré-calculados.\nAtribua código SINAPI BA a cada item.`
             : `Arquivo DXF: "${pend.fileName}" · Disciplina: ${pend.disciplina||"a identificar"}\nResumo: ${pend.dxfData.resumo.total_layers} layers · ${pend.dxfData.resumo.total_comprimento_m}m · ${pend.dxfData.resumo.total_blocos} blocos.\nQuantifique todos os elementos.`;
-          const reqBodyDxf=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:32768,system:dxfPrompt,
+          const reqBodyDxf=JSON.stringify({model:"gemini-2.5-flash",max_tokens:32768,system:dxfPrompt,
             messages:[{role:"user",content:[{type:"text",text:dxfUserText}]}]});
           const chamarDxf=async()=>{
+            const agora=Date.now(); const esp=3500-(agora-ultimaRequisicao.current);
+            if(esp>0) await new Promise(r=>setTimeout(r,esp));
+            ultimaRequisicao.current=Date.now();
             const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf});
             try{ return await resp.json(); }
             catch{ return {error:{type:"parse_error",message:`HTTP ${resp.status}`}}; }
           };
           let dataDxf=await chamarDxf();
-          for(let rt=0;rt<5&&dataDxf.error?.type==="rate_limit";rt++){
-            const espera=(dataDxf.error.retryAfter||20)*1000;
+          for(let rt=0;rt<8&&dataDxf.error?.type==="rate_limit";rt++){
+            const espera=(dataDxf.error.retryAfter||30)*1000;
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s...`}:x));
             await new Promise(r=>setTimeout(r,espera));
             dataDxf=await chamarDxf();
           }
-          if(dataDxf.error) throw new Error(`Claude: ${dataDxf.error.message||dataDxf.error.type}`);
+          if(dataDxf.error) throw new Error(`Gemini: ${dataDxf.error.message||dataDxf.error.type}`);
           const dxfText=dataDxf.content?.find(b=>b.type==="text")?.text||"{}";
           const dxfClean=dxfText.replace(/```json[\s\S]*?```|```[\s\S]*?```/g,m=>m.replace(/```json|```/g,"")).replace(/```json|```/g,"").trim();
           let parsedDxf={itens:[]};
@@ -1735,9 +1739,11 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
         const isPDFBruto=pend.imgs.length===1&&pend.imgs[0].type==="application/pdf";
         const nTiles=pend.imgs.length;
         for(let i=0;i<nTiles;i++){
+          // Delay de 3s entre tiles para respeitar 20 RPM do Gemini (melhora: era 4s)
+          if(i>0) await new Promise(r=>setTimeout(r,3000));
           const img=pend.imgs[i];
           const tileLabel=img._tileLabel||`imagem ${i+1}/${nTiles}`;
-          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`Claude lendo ${tileLabel}${pend.disciplina?` · ${pend.disciplina}`:""}...`}:x));
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`IA lendo ${tileLabel}${pend.disciplina?` · ${pend.disciplina}`:""}...`}:x));
           const imgSource = img.file_id
             ? { type:"file", file_id:img.file_id }
             : { type:"base64", media_type:img.type, data:img.base64 };
@@ -1750,27 +1756,35 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           } else {
             userText=`Analise esta prancha${pend.disciplina?` de ${pend.disciplina}`:""}: ${pend.fileName}. Imagem em alta resolução — leia todas as cotas e anotações.`;
           }
-          const reqBody=JSON.stringify({model:"claude-sonnet-4-6",max_tokens:32768,system:prompt,
+          const reqBody=JSON.stringify({model:"gemini-2.5-flash",max_tokens:32768,system:prompt,
             messages:[{role:"user",content:[
               {type:"image",source:imgSource},
               {type:"text",text:userText}
             ]}]
           });
           const chamar=async()=>{
+            const agora=Date.now(); const esp=3500-(agora-ultimaRequisicao.current);
+            if(esp>0) await new Promise(r=>setTimeout(r,esp));
+            ultimaRequisicao.current=Date.now();
             const resp=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBody});
             if(resp.status===413) return {error:{type:"file_too_large",message:"PDF muito grande (>4,5 MB). Tente comprimir ou dividir o arquivo."}};
             try{ return await resp.json(); }
             catch{ return {error:{type:"parse_error",message:`Resposta inesperada do servidor (HTTP ${resp.status})`}}; }
           };
           let data=await chamar();
-          for(let rt=0;rt<5&&data.error?.type==="rate_limit";rt++){
-            const espera=(data.error.retryAfter||20)*1000;
-            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/5)...`}:x));
+          for(let rt=0;rt<8&&data.error?.type==="rate_limit";rt++){
+            const espera=(data.error.retryAfter||30)*1000;
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/8)...`}:x));
             await new Promise(r=>setTimeout(r,espera));
             data=await chamar();
           }
+          for(let rt=0;rt<3&&data.error?.type==="gemini_error";rt++){
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Erro Gemini, aguardando 10s (tentativa ${rt+2}/4)...`}:x));
+            await new Promise(r=>setTimeout(r,10000));
+            data=await chamar();
+          }
           if(data.error){
-            throw new Error(`Claude: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
+            throw new Error(`Gemini: ${data.error.message||data.error.type||JSON.stringify(data.error)}`);
           }
           if(!data.content){
             throw new Error(`Resposta inesperada da API: ${JSON.stringify(data).slice(0,200)}`);
@@ -1860,10 +1874,10 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       }
     };
 
-    // Processa até 3 plantas simultaneamente (workers disputam a mesma fila)
+    // Processa até 2 plantas simultaneamente — throttle global de 3.5s garante ≤17 RPM no Gemini
     const queue=[...prontas];
     const worker=async()=>{ let p; while((p=queue.shift())) await processarPlanta(p); };
-    await Promise.all(Array.from({length:Math.min(3,prontas.length)},worker));
+    await Promise.all(Array.from({length:Math.min(2,prontas.length)},worker));
 
     setOrcando(false);
     setTimeout(()=>setPendentes(p=>p.filter(x=>x.status!=="concluido"&&x.status!=="erro")),15000);

@@ -1,16 +1,11 @@
-// DXF parser — extrai dados geométricos exatos do AutoCAD para o sistema de quantitativos
-// Recebe o arquivo DXF como multipart/form-data, retorna JSON estruturado por layer
-
 import { Helper } from "dxf";
 
 // ── Utilidades geométricas ────────────────────────────────────────────────────
 
-// Distância entre dois pontos 2D
 function dist(a, b) {
   return Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2);
 }
 
-// Comprimento de uma LWPOLYLINE como soma de segmentos
 function polylineLength(vertices) {
   if (!vertices || vertices.length < 2) return 0;
   let len = 0;
@@ -20,7 +15,7 @@ function polylineLength(vertices) {
   return len;
 }
 
-// Área de polígono fechado (fórmula de Gauss/Shoelace) em unidades²
+// Shoelace formula — returns area in drawing units²
 function polylineArea(vertices) {
   if (!vertices || vertices.length < 3) return 0;
   let area = 0;
@@ -33,39 +28,88 @@ function polylineArea(vertices) {
   return Math.abs(area) / 2;
 }
 
-// Comprimento de uma LINE
 function lineLength(e) {
   if (!e.start || !e.end) return 0;
   return dist(e.start, e.end);
 }
 
-// Detecta unidade do arquivo DXF pelo header $INSUNITS
-// 0=Sem unidade, 1=Polegadas, 2=Pés, 4=mm, 5=cm, 6=m
+// dxf library exposes header as camelCase (insUnits, not $INSUNITS)
+// 0=unitless, 1=inches, 2=feet, 4=mm, 5=cm, 6=m
 function detectarFatorUnidade(parsed) {
-  const insUnits = parsed?.header?.$INSUNITS ?? 4; // default: mm
+  const insUnits = parsed?.header?.insUnits ?? 4;
   switch (insUnits) {
-    case 1: return 25.4;      // polegadas → mm
-    case 2: return 304.8;     // pés → mm
-    case 4: return 1;         // mm → mm (padrão Brasil)
-    case 5: return 10;        // cm → mm
-    case 6: return 1000;      // m → mm
-    default: return 1;        // assume mm
+    case 1: return 25.4;
+    case 2: return 304.8;
+    case 4: return 1;
+    case 5: return 10;
+    case 6: return 1000;
+    default: return 1;
   }
 }
 
-// Layers a ignorar — eixos, cotas, referências, hachuras, viewports
+// ── Normalização de blocos BIM (Revit/ArchiCAD) ───────────────────────────────
+
+// Strips Revit element ID and view suffix from block name:
+//   "Guarda-corpo - Guarda-corpo-1594491-Nível 1 - Layout" → "Guarda-corpo - Guarda-corpo"
+//   "_ARQPWR_JANELA J21-1591519-BB_" → "_ARQPWR_JANELA J21"
+//   "Tipo de Corrimão-V36-Nível 1 - Layout" → "Tipo de Corrimão"
+function normalizarNomeBloco(nome) {
+  return nome
+    .replace(/-(AA|BB)_$/i, "")
+    .replace(/-N.{1,3}vel\s+\d+\s*-\s*Layout$/i, "")  // "Nível N - Layout" (inc. mojibake)
+    .replace(/-\d{5,}$/, "")
+    .replace(/-V\d+$/, "")
+    .trim();
+}
+
+// Extracts the element ID used to deduplicate across views
+function extrairIdElemento(nome) {
+  const m = nome.match(/-(\d{5,}|V\d+)(?:-(AA|BB)_|-N.+)?$/i);
+  return m ? m[1] : nome;
+}
+
+// ── Filtros de layer ──────────────────────────────────────────────────────────
+
 const LAYER_IGNORE_PATTERNS = [
-  /defpoints/i, /eixo/i, /grid/i, /refer/i, /auxiliar/i,
-  /^dim/i, /cota/i, /^hatch/i, /hachur/i, /0$/,
-  /viewport/i, /^vport/i, /margin/i, /borda/i, /moldura/i,
-  /^model/i, /leader/i, /^north/i, /norte/i, /seta/i,
-  /^text_/i, /legenda/i, /^leg/i,
+  // Portuguese names
+  /defpoints/i, /eixo/i, /refer/i, /auxiliar/i, /cota/i, /hachur/i,
+  /borda/i, /moldura/i, /leader/i, /norte/i, /seta/i, /legenda/i,
+  // AIA naming conventions (annotation, pattern, grid, title block)
+  /-anno/i,       // A-ANNO-*, G-ANNO-* (all annotation layers)
+  /-patt$/i,      // *-PATT (hatch/fill patterns)
+  /-iden$/i,      // *-IDEN (identifier labels)
+  /-levl$/i,      // *-LEVL (level markers)
+  /-ttlb/i,       // *-TTLB (title block)
+  /-schd$/i,      // *-SCHD (schedule tables)
+  /-nplt$/i,      // *-NPLT (non-plottable notes)
+  /-symb$/i,      // *-SYMB (symbols)
+  /^g-/i,         // G-* layers (general/title annotation)
+  /^s-grid/i,     // S-GRID* (structural grid axes)
+  /viewport/i, /^vport/i,
+  /^0$/,          // default unnamed layer
+  /^hold$/i,
 ];
+
 function deveIgnorarLayer(nome) {
   return LAYER_IGNORE_PATTERNS.some(p => p.test(nome || ""));
 }
 
+// Blocos de anotação (não representam elementos físicos quantificáveis)
+const BLOCO_ANNOTATION_PATTERNS = [
+  /^eixo\s*-/i, /swk-id/i, /swk-simb/i, /swk-/i,
+  /cota de n/i, /cota de nivel/i,
+  /filled arrow/i, /inclina/i,
+  /^norte/i, /^folha\s+-\s+a\d/i,
+  /^corte\s*-\s*swk/i,
+  /^eleva.{1,6}o\s*-\s*filled/i,
+];
+
+function eAnnotationBloco(nome) {
+  return BLOCO_ANNOTATION_PATTERNS.some(p => p.test(nome || ""));
+}
+
 // ── Handler principal ─────────────────────────────────────────────────────────
+
 export async function POST(request) {
   const formData = await request.formData();
   const file = formData.get("file");
@@ -86,20 +130,22 @@ export async function POST(request) {
     return Response.json({ error: "DXF inválido: " + e.message }, { status: 400 });
   }
 
-  // Unidade → converte tudo para metros ao final
   const fatorUnidade = detectarFatorUnidade(parsed);
-  const toM  = (mm) => (mm * fatorUnidade) / 1000;   // → metros
-  const toM2 = (mm2) => (mm2 * fatorUnidade ** 2) / 1e6; // → m²
+  const toM  = (u) => (u * fatorUnidade) / 1000;
+  const toM2 = (u) => (u * fatorUnidade ** 2) / 1e6;
 
-  // ── Processa entidades ────────────────────────────────────────────────────────
-  const layers = {};      // layer_name → { comprimento_m, area_m2, contagem, tipos, blocos, textos }
-  const blocos = {};      // block_name → { contagem, layers }
-  const textos = [];      // todos os textos/anotações relevantes
-  const dimensions = [];  // dimensões extraídas de DIMENSION entities
+  // layer_name → { comprimento, area, contagem, tipos, blocoIds, textos }
+  const layers = {};
+  // normalized_block_name → { elementIds: Set, layers: {} }
+  const blocos = {};
+  const textos = [];
+  const dimensions = [];
 
   function getLayer(nome) {
     const n = nome || "0";
-    if (!layers[n]) layers[n] = { comprimento: 0, area: 0, contagem: 0, tipos: new Set(), blocos: {}, textos: [] };
+    if (!layers[n]) {
+      layers[n] = { comprimento: 0, area: 0, contagem: 0, tipos: new Set(), blocos: {}, textos: [] };
+    }
     return layers[n];
   }
 
@@ -108,6 +154,9 @@ export async function POST(request) {
     const layerName = e.layer || "0";
     if (deveIgnorarLayer(layerName)) continue;
 
+    // Skip hatch fills — they don't represent measurable elements
+    if (e.type === "HATCH") continue;
+
     const L = getLayer(layerName);
     L.contagem++;
     L.tipos.add(e.type);
@@ -115,39 +164,48 @@ export async function POST(request) {
     switch (e.type) {
       case "LINE": {
         const len = toM(lineLength(e));
-        if (len > 0 && len < 1000) L.comprimento += len; // filtra linhas absurdas
+        if (len > 0 && len < 2000) L.comprimento += len;
         break;
       }
       case "LWPOLYLINE":
       case "POLYLINE": {
         const verts = e.vertices ?? e.points ?? [];
         const len = toM(polylineLength(verts));
-        if (len > 0 && len < 10000) L.comprimento += len;
+        if (len > 0 && len < 20000) L.comprimento += len;
         if (e.closed) {
           const area = toM2(polylineArea(verts));
           if (area > 0 && area < 1e6) L.area += area;
         }
         break;
       }
-      case "CIRCLE":
-      case "ARC": {
+      case "ARC":
+      case "CIRCLE": {
         const r = toM(e.radius ?? 0);
         if (r > 0) {
-          L.comprimento += 2 * Math.PI * r * (e.type === "ARC" ? Math.abs((e.endAngle ?? 360) - (e.startAngle ?? 0)) / 360 : 1);
+          const frac = e.type === "ARC"
+            ? Math.abs((e.endAngle ?? 360) - (e.startAngle ?? 0)) / 360
+            : 1;
+          L.comprimento += 2 * Math.PI * r * frac;
           if (e.type === "CIRCLE") L.area += Math.PI * r * r;
         }
         break;
       }
       case "INSERT": {
-        const blockName = e.name || e.block || "?";
-        L.contagem--; // já contado acima, não conta como genérico
-        // Incrementa contagem de bloco por layer
-        if (!L.blocos[blockName]) L.blocos[blockName] = 0;
-        L.blocos[blockName]++;
-        // Contagem global de blocos
-        if (!blocos[blockName]) blocos[blockName] = { contagem: 0, layers: {} };
-        blocos[blockName].contagem++;
-        blocos[blockName].layers[layerName] = (blocos[blockName].layers[layerName] || 0) + 1;
+        const rawName = e.name || e.block || "?";
+        if (eAnnotationBloco(rawName)) { L.contagem--; break; }
+
+        const nomeNorm = normalizarNomeBloco(rawName);
+        const elemId   = extrairIdElemento(rawName);
+
+        // Undoes the generic contagem++ above (INSERT counted separately)
+        L.contagem--;
+
+        if (!L.blocos[nomeNorm]) L.blocos[nomeNorm] = new Set();
+        L.blocos[nomeNorm].add(elemId);
+
+        if (!blocos[nomeNorm]) blocos[nomeNorm] = { elementIds: new Set(), layers: {} };
+        blocos[nomeNorm].elementIds.add(elemId);
+        blocos[nomeNorm].layers[layerName] = (blocos[nomeNorm].layers[layerName] || 0) + 1;
         break;
       }
       case "TEXT":
@@ -163,10 +221,9 @@ export async function POST(request) {
         const val = e.actualMeasurement ?? e.measurement;
         if (val && val > 0) {
           dimensions.push({
-            valor_mm: val * fatorUnidade,
-            valor_m: toM(val),
-            layer: layerName,
-            texto: e.text || "",
+            valor_m:  toM(val),
+            layer:    layerName,
+            texto:    e.text || "",
           });
         }
         break;
@@ -174,35 +231,43 @@ export async function POST(request) {
     }
   }
 
-  // ── Serializa layers para JSON (Set não serializa direto) ─────────────────────
+  // ── Serializa layers ──────────────────────────────────────────────────────────
   const layersJson = {};
   for (const [nome, L] of Object.entries(layers)) {
-    if (L.contagem <= 0 && L.comprimento < 0.01 && L.area < 0.01 && Object.keys(L.blocos).length === 0) continue;
+    // Serialize blocos: Set of element IDs → count of unique physical elements
+    const blocosSerial = {};
+    for (const [bn, ids] of Object.entries(L.blocos)) {
+      blocosSerial[bn] = ids.size;
+    }
+    const totalBlocos = Object.values(blocosSerial).reduce((s, v) => s + v, 0);
+    if (L.contagem <= 0 && L.comprimento < 0.01 && L.area < 0.01 && totalBlocos === 0) continue;
     layersJson[nome] = {
       contagem:    Math.round(L.contagem),
-      comprimento: Math.round(L.comprimento * 100) / 100,  // 2 casas decimais em m
-      area:        Math.round(L.area * 100) / 100,          // 2 casas decimais em m²
+      comprimento: Math.round(L.comprimento * 100) / 100,
+      area:        Math.round(L.area * 100) / 100,
       tipos:       [...L.tipos],
-      blocos:      L.blocos,
-      textos:      L.textos.slice(0, 20),                   // limita para não sobrecarregar
+      blocos:      blocosSerial,
+      textos:      L.textos.slice(0, 20),
     };
   }
 
-  // ── Blocos mais relevantes (mais de 1 ocorrência) ─────────────────────────────
+  // ── Blocos globais (elementos físicos únicos) ─────────────────────────────────
   const blocosRelevantes = Object.entries(blocos)
+    .map(([nome, v]) => [nome, { contagem: v.elementIds.size, layers: v.layers }])
     .filter(([, v]) => v.contagem > 0)
     .sort(([, a], [, b]) => b.contagem - a.contagem)
-    .slice(0, 60)
+    .slice(0, 80)
     .reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});
 
-  // ── Resumo geral ──────────────────────────────────────────────────────────────
+  // ── Resumo ────────────────────────────────────────────────────────────────────
   const nLayers = Object.keys(layersJson).length;
   const totalComprimento = Object.values(layersJson).reduce((s, l) => s + l.comprimento, 0);
   const totalArea        = Object.values(layersJson).reduce((s, l) => s + l.area, 0);
   const totalBlocos      = Object.values(blocosRelevantes).reduce((s, b) => s + b.contagem, 0);
+  const escalaMatch      = textos.find(t => /escala\s*[1:]/i.test(t.texto) || /^1:\d+$/.test(t.texto.trim()));
 
-  // Extrai possível escala do texto do arquivo
-  const escalaMatch = textos.find(t => /escala\s*[1:]/i.test(t.texto) || /^1:\d+$/.test(t.texto.trim()));
+  const unidadeNome =
+    fatorUnidade === 1 ? "mm" : fatorUnidade === 10 ? "cm" : fatorUnidade === 1000 ? "m" : "outro";
 
   return Response.json({
     layers:    layersJson,
@@ -210,12 +275,12 @@ export async function POST(request) {
     textos:    textos.slice(0, 80),
     dimensoes: dimensions.slice(0, 100),
     resumo: {
-      total_layers:       nLayers,
+      total_layers:        nLayers,
       total_comprimento_m: Math.round(totalComprimento * 10) / 10,
       total_area_m2:       Math.round(totalArea * 10) / 10,
       total_blocos:        totalBlocos,
       escala:              escalaMatch?.texto || null,
-      unidade_detectada:   fatorUnidade === 1 ? "mm" : fatorUnidade === 10 ? "cm" : fatorUnidade === 1000 ? "m" : "outro",
+      unidade_detectada:   unidadeNome,
     },
   });
 }
