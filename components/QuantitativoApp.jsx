@@ -12,24 +12,105 @@ function getSinapiPrecoLocal(codigo) {
   return SINAPI_MAP[key]?.preco || null;
 }
 
-// Resolve preços + unidades SINAPI para validação cruzada
+// ─── BANCO ARQMEDES (localStorage) ───────────────────────────────────────────
+// Persiste no localStorage; carregado em memória na primeira chamada.
+const _arq = { itens: null, map: null };
+function _carregarArqLocal() {
+  if (_arq.itens !== null) return;
+  try {
+    const raw = typeof window !== "undefined" && localStorage.getItem("qt_banco_arqmedes");
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      _arq.itens = parsed.itens || [];
+      _arq.map   = Object.fromEntries(_arq.itens.map(i => [String(i.codigo||"").trim(), i]));
+    } else {
+      _arq.itens = [];
+      _arq.map   = {};
+    }
+  } catch { _arq.itens = []; _arq.map = {}; }
+}
+function getArqItens()  { _carregarArqLocal(); return _arq.itens; }
+function getArqMap()    { _carregarArqLocal(); return _arq.map; }
+function setArqBanco(itens, meta = {}) {
+  _arq.itens = itens;
+  _arq.map   = Object.fromEntries(itens.map(i => [String(i.codigo||"").trim(), i]));
+  try {
+    localStorage.setItem("qt_banco_arqmedes", JSON.stringify({ ...meta, itens, salvoEm: new Date().toISOString() }));
+    localStorage.setItem("qt_banco_arqmedes_meta", JSON.stringify({ ...meta, totalItens: itens.length, salvoEm: new Date().toISOString() }));
+  } catch(e) { console.warn("[Arqmedes] localStorage cheio:", e); }
+}
+function limparArqBanco() {
+  _arq.itens = []; _arq.map = {};
+  try { localStorage.removeItem("qt_banco_arqmedes"); localStorage.removeItem("qt_banco_arqmedes_meta"); } catch {}
+}
+function getArqMeta() {
+  try {
+    const m = typeof window !== "undefined" && localStorage.getItem("qt_banco_arqmedes_meta");
+    return m ? JSON.parse(m) : null;
+  } catch { return null; }
+}
+
+// Busca semântica no banco Arqmedes (client-side, sem rede)
+function buscarArqmedes(desc, unItem) {
+  const itens = getArqItens();
+  if (!itens?.length) return null;
+  const normS = s => String(s||"").normalize("NFD").replace(/[̀-ͯ]/g,"").toLowerCase();
+  const nd = normS(desc);
+  const termos = nd.split(/\s+/).filter(t => t.length > 2);
+  if (!termos.length) return null;
+  const GRUPOS_UN = [["m2","m²"],["m3","m³"],["kg","kgf"],["un","unid","und","cj","pç"],["h","hr","hora"],["l","litro","lt"],["m","ml","metro"]];
+  let melhor = null, melhorScore = 0;
+  for (const item of itens) {
+    const di = normS(item.descricao);
+    let score = nd.length > 4 && di.includes(nd) ? nd.length * 4 : 0;
+    for (const t of termos) {
+      if (!di.includes(t)) continue;
+      let w = t.length > 6 ? 4 : t.length > 3 ? 2 : 1;
+      if (di.startsWith(t)) w += 2;
+      score += w;
+    }
+    if (unItem && item.un) {
+      const n1 = normS(unItem).replace(/\s/g,""), n2 = normS(item.un).replace(/\s/g,"");
+      if (n1 === n2 || GRUPOS_UN.some(g => g.includes(n1) && g.includes(n2))) score += 5;
+    }
+    if (score > melhorScore) { melhorScore = score; melhor = item; }
+  }
+  return melhorScore >= 3 ? { ...melhor, _score: melhorScore } : null;
+}
+
+// Resolve preços + unidades — Arqmedes primeiro, SINAPI como fallback
 async function resolverPrecosBatch(itens) {
   const precoMap = {};
-  const unMap    = {}; // codigo → unidade real no SINAPI
+  const unMap    = {}; // codigo → unidade real
+  const fonteMap = {}; // "arqmedes" | "sinapi"
   const semPreco = [];
 
-  // 1ª passagem: batch por código
+  // 1ª passagem: batch por código — Arqmedes local primeiro
   const codigos = [...new Set([
     ...itens.map(i => i.sinapi_sugerido),
     ...itens.map(i => i.mat_sinapi),
   ].filter(Boolean))];
-  if (codigos.length) {
+
+  const arqMapLocal = getArqMap();
+  for (const cod of codigos) {
+    const item = arqMapLocal?.[cod];
+    if (item?.preco) {
+      precoMap[cod] = item.preco;
+      unMap[cod]    = item.un;
+      fonteMap[cod] = "arqmedes";
+    }
+  }
+
+  // Busca no SINAPI apenas os que não vieram do Arqmedes
+  const codigosSinapi = codigos.filter(c => !precoMap[c]);
+  if (codigosSinapi.length) {
     try {
-      const r = await fetch(`/api/sinapi?codigos=${encodeURIComponent(codigos.join(","))}`);
+      const r = await fetch(`/api/sinapi?codigos=${encodeURIComponent(codigosSinapi.join(","))}`);
       const d = await r.json();
       if (d.mapa) Object.entries(d.mapa).forEach(([cod, item]) => {
         precoMap[cod] = item.preco;
         unMap[cod]    = item.un;
+        fonteMap[cod] = "sinapi";
       });
     } catch {}
   }
@@ -40,21 +121,36 @@ async function resolverPrecosBatch(itens) {
   await Promise.all(semPreco.map(async it => {
     const desc = it.sinapi_descricao || it.descricao || "";
     if (!desc) return;
+
+    // Tenta Arqmedes semântico primeiro (sem rede)
+    const arqRes = buscarArqmedes(desc, it.un);
+    if (arqRes?.preco) {
+      const chave = it.sinapi_sugerido || desc;
+      precoMap[chave] = arqRes.preco;
+      unMap[chave]    = arqRes.un;
+      fonteMap[chave] = "arqmedes";
+      it._arqmedes_real = arqRes;
+      return; // não precisa ir ao SINAPI
+    }
+
+    // Fallback SINAPI
     try {
       const params = new URLSearchParams({ match: desc, top: "3" });
       if (it.un) params.set("un", it.un);
       const r = await fetch(`/api/sinapi?${params}`);
       const d = await r.json();
       if (d.item?.preco) {
-        precoMap[it.sinapi_sugerido || desc] = d.item.preco;
-        unMap[it.sinapi_sugerido || desc]    = d.item.un;
+        const chave = it.sinapi_sugerido || desc;
+        precoMap[chave] = d.item.preco;
+        unMap[chave]    = d.item.un;
+        fonteMap[chave] = "sinapi";
         it._sinapi_real = { codigo: d.item.codigo, descricao: d.item.descricao, preco: d.item.preco, un: d.item.un };
         it._sinapi_top3 = d.top3 || [];
       }
     } catch {}
   }));
 
-  return { precoMap, unMap };
+  return { precoMap, unMap, fonteMap };
 }
 
 // ─── UPLOAD DIRETO PARA GEMINI FILE API (contorna limite 4,5 MB do Vercel) ───
@@ -160,6 +256,21 @@ function detectarTipoPrancha(fileName) {
   // Arquivo com "ISO" no nome
   if (u.includes("ISO") || u.includes("ISOMETRIC")) return "isometrico";
   return null;
+}
+
+// Detecta arquivos que claramente não são plantas de engenharia
+function eNaoPlanta(fileName) {
+  if (!fileName) return false;
+  const n = fileName.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, ""); // remove acentos
+  const keywords = [
+    "instrucao", "instrução", "manual", "nomenclatura", "procedimento",
+    "especificacao", "relatorio", "norma ", "ata ", "memo", "memorando",
+    "cronograma", "planilha", "indice", "lista de", "apresentacao",
+    "rev.01.pdf", // instrução de nomenclatura típica
+  ];
+  if (keywords.some(k => n.includes(k))) return true;
+  if (fileName.startsWith("- ") || fileName.startsWith(". ")) return true; // arquivo com prefixo estranho
+  return false;
 }
 
 function avisoTipoPrancha(fileName) {
@@ -429,50 +540,234 @@ function getPrompt(d, obraCtx = "", fileName = "") {
   return partes.join("\n\n");
 }
 
+// ── Fase 1: interpreta camadas DXF → elementos construtivos (sem IA) ─────────
+// Retorna lista pronta para SINAPI matching; a IA só precisa atribuir código e preço
+function interpretarLayersDXF(dxfData, obra) {
+  const { layers = {}, blocos = {} } = dxfData;
+  const altPiso = parseFloat(obra?.altura_piso) || 3.5;
+  const elementos = [];
+
+  const add = (tipo, descricao, qtd, un, obs) => {
+    if (qtd > 0) elementos.push({ tipo, descricao, qtd: Math.round(qtd * 100) / 100, un, obs: obs || null });
+  };
+
+  // ── Paredes ───────────────────────────────────────────────────────────────
+  const awall = layers["A-WALL"] || layers["PAREDE"] || layers["PAR"] || layers["ALV"];
+  if (awall?.comprimento > 0) {
+    // Em CAD, cada parede tem 2 linhas (faces); comprimento real ≈ total/2
+    const compReal = awall.comprimento / 2;
+    add("alvenaria", "Alvenaria de vedação", compReal * altPiso, "m²", `${compReal.toFixed(1)}m linear × ${altPiso}m`);
+  }
+
+  // ── Vigas ─────────────────────────────────────────────────────────────────
+  const sbeam = layers["S-BEAM"] || layers["VIGA"] || layers["VIG"];
+  if (sbeam?.comprimento > 0) {
+    const comp = sbeam.comprimento / 2; // 2 linhas por viga (sup + inf)
+    add("viga", "Vigas estruturais concreto armado FCK 25 MPa", comp, "m", `${sbeam.comprimento.toFixed(1)}m total ÷2`);
+  }
+
+  // ── Pilares ───────────────────────────────────────────────────────────────
+  const scols = layers["S-COLS"] || layers["PILAR"] || layers["PIL"];
+  if (scols?.comprimento > 0) {
+    // Pilar típico industrial 40×40cm → perímetro 1.6m
+    const nPil = Math.round(scols.comprimento / 1.6);
+    add("pilar", "Pilares de concreto armado FCK 25 MPa", nPil, "un", `${scols.comprimento.toFixed(1)}m contorno ÷1.6m/pilar`);
+  }
+
+  // ── Cobertura ─────────────────────────────────────────────────────────────
+  const aroof = layers["A-ROOF"] || layers["COBERT"] || layers["TELHA"];
+  if (aroof?.comprimento > 0) {
+    add("cobertura", "Cobertura (calhas, cumeeiras, rufos)", aroof.comprimento, "m", "comprimento total de linhas de cobertura");
+  }
+
+  // ── Piso/Laje ─────────────────────────────────────────────────────────────
+  const afloor = layers["A-FLOR"] || layers["PISO"] || layers["LAJE"];
+  if (afloor?.area > 0) {
+    add("piso", "Piso / Laje de piso", afloor.area, "m²", "área medida de polilinha fechada");
+  } else if (afloor?.comprimento > 0) {
+    // Estimativa: área ≈ (perímetro/4)² para forma quadrada
+    const perim = afloor.comprimento / 4;
+    const areaEst = Math.round(perim * perim * 100) / 100;
+    if (areaEst > 5 && areaEst < 50000) {
+      add("piso", "Piso / Laje de piso (estimado)", areaEst, "m²", `estimado por perímetro ${afloor.comprimento.toFixed(0)}m`);
+    }
+  }
+
+  // ── Revestimento de piso ──────────────────────────────────────────────────
+  const afloorFnsh = layers["A-FLOR-FNSH"];
+  if (afloorFnsh?.comprimento > 0) {
+    const perim = afloorFnsh.comprimento / 4;
+    const areaEst = Math.round(perim * perim * 100) / 100;
+    if (areaEst > 5 && areaEst < 50000) {
+      add("revestimento_piso", "Revestimento de piso (cerâmico / porcelanato)", areaEst, "m²", `estimado por contorno ${afloorFnsh.comprimento.toFixed(0)}m`);
+    }
+  }
+
+  // ── Blocos Revit: janelas, portas, guarda-corpos, corrimões ───────────────
+  const contagemBlocos = {};
+  for (const [nome, b] of Object.entries(blocos)) {
+    const n = nome.toLowerCase();
+    // Ignora sub-componentes (folhas, maçanetas, venezianas são partes de janelas/portas)
+    if (/_arqpwr_folha/i.test(nome) || /_arqpwr_ma[çc]aneta/i.test(nome) || /veneziana/i.test(nome)) continue;
+
+    if (/_arqpwr_janela/i.test(nome)) {
+      // Extrai tipo (J02, J21) e dimensões do nome
+      const tipo = (nome.match(/\b(J\d+)\b/i) || [])[1] || "janela";
+      const dim  = (nome.match(/(\d+)\s*[xX×]\s*(\d+)\s*cm/i) || []);
+      const desc = dim.length ? `Janela ${tipo} ${parseInt(dim[1])/100}×${parseInt(dim[2])/100}m` : `Janela ${tipo}`;
+      contagemBlocos[desc] = (contagemBlocos[desc] || 0) + b.contagem;
+    } else if (/_arqpwr_porta/i.test(nome)) {
+      const tipo = (nome.match(/\b(P\d+)\b/i) || [])[1] || "porta";
+      const dim  = (nome.match(/(\d+)\s*[xX×]\s*(\d+)\s*cm/i) || []);
+      const desc = dim.length ? `Porta ${tipo} ${parseInt(dim[1])/100}×${parseInt(dim[2])/100}m` : `Porta ${tipo}`;
+      contagemBlocos[desc] = (contagemBlocos[desc] || 0) + b.contagem;
+    } else if (/guarda[- _]?corpo/i.test(nome)) {
+      contagemBlocos["Guarda-corpo"] = (contagemBlocos["Guarda-corpo"] || 0) + b.contagem;
+    } else if (/corrim[aã]/i.test(n) && /superior/i.test(n)) {
+      contagemBlocos["Corrimão superior"] = (contagemBlocos["Corrimão superior"] || 0) + b.contagem;
+    } else if (/corrim[aã]/i.test(n)) {
+      // Extrai dimensão se tiver (ex: "40 mm x 200 mm x 220 mm")
+      const dim = nome.match(/(\d+)\s*mm\s*[xX×]\s*(\d+)\s*mm/i);
+      const desc = dim ? `Corrimão ${dim[1]}×${dim[2]}mm` : "Corrimão";
+      contagemBlocos[desc] = (contagemBlocos[desc] || 0) + b.contagem;
+    } else if (/shaft|drenagem/i.test(nome)) {
+      contagemBlocos["Shaft de drenagem"] = (contagemBlocos["Shaft de drenagem"] || 0) + b.contagem;
+    } else if (/rampa/i.test(nome)) {
+      contagemBlocos["Rampa de acesso"] = (contagemBlocos["Rampa de acesso"] || 0) + b.contagem;
+    } else if (b.contagem >= 1) {
+      // Bloco não reconhecido mas com contagem — inclui para a IA avaliar
+      const desc = nome.length > 60 ? nome.substring(0, 60) + "…" : nome;
+      contagemBlocos[desc] = (contagemBlocos[desc] || 0) + b.contagem;
+    }
+  }
+
+  for (const [desc, qtd] of Object.entries(contagemBlocos)) {
+    const n = desc.toLowerCase();
+    const tipo = /janela/i.test(n) ? "janela" : /porta/i.test(n) ? "porta"
+      : /guarda/i.test(n) ? "guarda_corpo" : /corrim/i.test(n) ? "corrimao"
+      : /shaft|drenagem/i.test(n) ? "shaft" : /rampa/i.test(n) ? "rampa" : "bloco";
+    add(tipo, desc, qtd, "un");
+  }
+
+  // ── Camadas genéricas (nomes em português) não mapeadas acima ────────────
+  const mapeadoLayers = new Set(["A-WALL","PAREDE","PAR","ALV","S-BEAM","VIGA","VIG","S-COLS","PILAR","PIL","A-ROOF","COBERT","TELHA","A-FLOR","PISO","LAJE","A-FLOR-FNSH"]);
+  for (const [nome, L] of Object.entries(layers)) {
+    if (mapeadoLayers.has(nome)) continue;
+    if (L.comprimento < 0.5 && L.area < 0.5 && Object.keys(L.blocos || {}).length === 0) continue;
+    // Heurísticas por nome de layer
+    const n = nome.toLowerCase();
+    if (/elet|ilum|qdr|spda/i.test(n))        add("eletrica", `Elétrica (layer ${nome})`, L.comprimento, "m");
+    else if (/hid|esg|agf|tubo|drena/i.test(n)) add("hidro", `Hidrossanitário (layer ${nome})`, L.comprimento, "m");
+    else if (/imperm|manta/i.test(n))           add("imperm", `Impermeabilização (layer ${nome})`, L.area || L.comprimento, L.area > 0 ? "m²" : "m");
+  }
+
+  return elementos;
+}
+
+// ── Fase 2: prompt compacto — IA só precisa resolver SINAPI ────────────────
+function getDxfSinapiPrompt(elementos, disciplina, obraCtx) {
+  const lista = elementos.map((e, i) =>
+    `${i + 1}. ${e.descricao}: ${e.qtd} ${e.un}${e.obs ? ` (${e.obs})` : ""}`
+  ).join("\n");
+
+  return `${obraCtx ? obraCtx + "\n\n" : ""}Você é um orçamentista de obras. As quantidades abaixo foram calculadas MATEMATICAMENTE a partir das coordenadas geométricas exatas de um arquivo DXF do AutoCAD — não são estimativas. Não discuta as quantidades; use-as diretamente.
+
+DISCIPLINA: ${disciplina || "Arquitetura"}
+
+ELEMENTOS LEVANTADOS DO DXF (quantidades exatas do CAD):
+${lista}
+
+Para cada elemento, retorne um JSON com o array "itens":
+{
+  "disciplina": "${disciplina || "Arquitetura"}",
+  "itens": [
+    {
+      "descricao": "descrição SINAPI completa",
+      "sinapi_sugerido": "código",
+      "preco_sinapi": número,
+      "qtd": número (use EXATAMENTE a quantidade acima),
+      "un": "unidade SINAPI",
+      "tipo": "MAT" ou "MO",
+      "confianca": "alta",
+      "obs": "breve justificativa do código escolhido"
+    }
+  ]
+}
+
+Referência SINAPI Bahia Não Desonerado. Para cada item, escolha o código mais adequado. Para mão de obra, crie itens MO separados. Retorne apenas o JSON, sem texto adicional.`;
+}
+
 // Prompt especializado para dados DXF (texto estruturado, não imagem)
+// Mapeamento de camadas padrão AIA (usado em projetos Revit/ArchiCAD exportados para DXF)
+const AIA_LAYER_MAP = {
+  "A-WALL":      "Alvenaria / Parede (comprimento = comprimento linear das paredes)",
+  "A-FLOR":      "Piso / Laje de piso (comprimento = linhas de contorno do piso)",
+  "A-FLOR-FNSH": "Revestimento de piso (acabamento / porcelanato / cerâmica)",
+  "A-DOOR":      "Portas — blocos = unidades exatas de portas",
+  "A-GLAZ":      "Janelas / Vidraças — blocos = unidades exatas de janelas",
+  "A-ROOF":      "Cobertura / Telhado (comprimento = calhas, cumeeiras)",
+  "A-ROOF-MCUT": "Cobertura — cortes de modelo (linhas de contorno)",
+  "A-DETL":      "Detalhes construtivos arquitetônicos",
+  "A-DETL-THIN": "Detalhes — linhas finas (contornos, hachuras de corte)",
+  "A-DETL-GENF": "Detalhes — quadros gerais",
+  "A-DETL-MEDM": "Detalhes — linhas médias",
+  "A-GENM":      "Elementos arquitetônicos gerais (escadas, rampas, mezanino)",
+  "S-COLS":      "Pilares estruturais (linhas formam o contorno da seção transversal)",
+  "S-BEAM":      "Vigas estruturais (comprimento = desenvolvimento total das vigas)",
+  "P-EQPM":      "Equipamentos hidráulicos / shafts de drenagem",
+  "Balaústres":  "Guarda-corpos / Balaústres (blocos = unidades)",
+  "Corrimão":    "Corrimão (blocos = segmentos / unidades)",
+  "Corrimões":   "Corrimões (blocos = segmentos)",
+  "Corrimões superiores": "Corrimões superiores (blocos = segmentos)",
+  "Terminações": "Terminações de escada / Corrimão terminação",
+};
+
 function getDxfPrompt(disciplina, obraCtx, dxfData) {
   const { layers, blocos, textos, dimensoes, resumo } = dxfData;
 
   const layersSummary = Object.entries(layers)
     .map(([nome, L]) => {
-      const partes = [`Layer "${nome}": ${L.contagem} entidades (${L.tipos.join(",")})`];
+      const elem = AIA_LAYER_MAP[nome] || "";
+      const partes = [`Layer "${nome}"${elem ? ` (→ ${elem})` : ""}: ${L.contagem} entidades (${L.tipos.join(",")})`];
       if (L.comprimento > 0.01) partes.push(`compr.=${L.comprimento}m`);
       if (L.area > 0.01)        partes.push(`área=${L.area}m²`);
-      if (Object.keys(L.blocos).length > 0) partes.push(`blocos: ${Object.entries(L.blocos).map(([k,v])=>`${k}×${v}`).join(", ")}`);
+      if (Object.keys(L.blocos).length > 0) {
+        partes.push(`blocos físicos: ${Object.entries(L.blocos).map(([k,v])=>`"${k}"×${v}`).join(", ")}`);
+      }
       if (L.textos.length > 0)  partes.push(`textos: "${L.textos.slice(0,5).join('", "')}"`);
       return partes.join(" | ");
     })
     .join("\n");
 
   const blocosSummary = Object.entries(blocos)
-    .slice(0, 30)
-    .map(([nome, b]) => `  ${nome}: ${b.contagem}× (layers: ${Object.keys(b.layers).join(",")})`)
+    .slice(0, 40)
+    .map(([nome, b]) => `  [${b.contagem}×] ${nome} (layers: ${Object.keys(b.layers).join(",")})`)
     .join("\n");
 
-  const textosSample = textos.slice(0, 40).map(t => `  [${t.layer}] "${t.texto}"`).join("\n");
-
-  const dimSample = dimensoes.slice(0, 20).map(d => `  ${d.valor_m.toFixed(3)}m (layer: ${d.layer})`).join("\n");
+  const textosSample = textos.slice(0, 30).map(t => `  [${t.layer}] "${t.texto}"`).join("\n");
+  const dimSample = dimensoes.slice(0, 15).map(d => `  ${d.valor_m.toFixed(3)}m (layer: ${d.layer})`).join("\n");
 
   const discPrompt = PROMPTS[disciplina] || `Especialista em engenharia civil. Identifique os elementos construtivos e extraia quantidades. ${BASE}`;
 
-  return `${obraCtx ? obraCtx + "\n\n" : ""}FONTE DE DADOS: ARQUIVO DXF do AutoCAD — dados geométricos EXATOS, não estimados.
-Os valores de comprimento e área foram calculados matematicamente a partir das coordenadas reais do desenho CAD.
-Unidade detectada: ${resumo.unidade_detectada} → todos os valores já convertidos para metros e m².
+  return `${obraCtx ? obraCtx + "\n\n" : ""}FONTE DE DADOS: ARQUIVO DXF do AutoCAD — coordenadas geométricas EXATAS, sem estimativas.
+Todos os valores de comprimento e área foram calculados matematicamente a partir das coordenadas CAD reais.
+Unidade original do arquivo: ${resumo.unidade_detectada} → tudo já convertido para metros (m) e metros quadrados (m²).
 ${resumo.escala ? `Escala declarada no arquivo: ${resumo.escala}` : ""}
 
 RESUMO DO ARQUIVO:
-- ${resumo.total_layers} layers com dados
+- ${resumo.total_layers} layers com geometria
 - Comprimento total acumulado: ${resumo.total_comprimento_m}m
 - Área total acumulada: ${resumo.total_area_m2}m²
-- Total de blocos/símbolos inseridos: ${resumo.total_blocos}
+- Elementos em blocos (únicos físicos): ${resumo.total_blocos}
 
-LAYERS E MEDIÇÕES:
+LAYERS COM MEDIÇÕES EXATAS:
 ${layersSummary}
 
-BLOCOS (símbolos inseridos — cada ocorrência = 1 elemento):
+BLOCOS INSERIDOS — CONTAGEM DE ELEMENTOS FÍSICOS ÚNICOS:
+(Os blocos Revit já foram deduplizados por ID de elemento — cada linha = elementos reais)
 ${blocosSummary || "  (nenhum bloco)"}
 
-TEXTOS/ANOTAÇÕES ENCONTRADOS:
+TEXTOS/ANOTAÇÕES DO ARQUIVO:
 ${textosSample || "  (nenhum)"}
 
 DIMENSÕES EXPLÍCITAS:
@@ -480,20 +775,35 @@ ${dimSample || "  (nenhuma)"}
 
 ${discPrompt}
 
-INSTRUÇÕES ESPECIAIS PARA DXF:
-- Os valores de comprimento/área acima são EXATOS — use-os diretamente sem converter
-- Para cada layer, identifique a que elemento construtivo corresponde pelo nome do layer
-- Layers com padrões como PILAR, PIL, P_EST, KZ → pilares
-- Layers VIGA, VIG, V_EST, VSP → vigas
-- Layers PAREDE, PAR, ALV, BLK → alvenaria
-- Layers PISO, LAJE, LAJ, SLB → laje/piso
-- Layers PORTA, P01, JNL, JANELA → esquadrias
-- Layers ELET, ILUM, QDR, CRC → elétrica
-- Layers TUBO, HID, ESG, AGF → hidrossanitária
-- Blocos com contagem = quantidade exata daquele elemento
-- Se um layer tem comprimento E área, o comprimento é o perímetro e a área é a superfície
+INSTRUÇÕES ESPECIAIS PARA DXF COM CAMADAS AIA (padrão Revit/ArchiCAD):
 
-Retorne JSON com as quantidades EXATAS dos dados acima. A confiança deve ser "alta" para todos os itens baseados em dados DXF.`;
+COMPRIMENTOS DE PAREDE (A-WALL):
+- O comprimento da layer A-WALL é o total linear das linhas de parede em planta
+- Cada parede tem 2 linhas (face interna + face externa), então comprimento real ≈ total / 2
+- Área de alvenaria = (comprimento_total / 2) × altura_piso (assuma 3,5m se não informado)
+- Use SINAPI: assentamento de bloco cerâmico ou de concreto conforme contexto da obra
+
+PILARES (S-COLS):
+- As linhas na S-COLS formam o contorno (perímetro) de seções de pilares
+- Estime número de pilares: comprimento_total / perímetro_típico (pilar 40×40cm = 1,6m, 30×70cm = 2,0m)
+- Volume de concreto = N_pilares × seção_transversal(m²) × altura_típica(m)
+
+VIGAS (S-BEAM):
+- O comprimento em S-BEAM representa o desenvolvimento das vigas (eixo neutro)
+- Pode haver 2-4 linhas por viga (face sup/inf/lat); divida por número de faces visíveis
+- Volume de concreto = comprimento_real × seção (typ. 0,25×0,50m)
+
+BLOCOS REVIT (janelas, portas, guarda-corpos):
+- Nome do bloco inclui tipo e dimensões: "J02 - 180 x 240 cm" = janela 1,80m × 2,40m
+- "P38 - 210 x 230 cm" = porta 2,10m × 2,30m
+- Contagem já é de elementos físicos únicos (deduplizados entre vistas do projeto)
+- Use a contagem diretamente como quantidade (un)
+
+PISO (A-FLOR):
+- Comprimento são contornos de áreas de piso; use para estimar área pavimentada
+- Área total do piso ≈ (comprimento_A-FLOR × comprimento médio do vão) / 4
+
+Retorne JSON com quantidades EXATAS. Confiança = "alta" para todos os itens de DXF.`;
 }
 
 // Fatores de preço SINAPI por categoria (% do SINAPI Bahia)
@@ -686,7 +996,8 @@ export default function QuantitativoApp() {
   const [secao,setSecao]         = useState("obras");
   const [clientes,setClientes] = useState([]);
   const [obras,setObras]       = useState([]);
-  const [sinapiRef,setSinapiRef] = useState(null);
+  const [sinapiRef,setSinapiRef]   = useState(null);
+  const [arqMeta,setArqMeta]       = useState(null);
   const iniciado = useRef(false);
 
   // Carrega do localStorage só no cliente (fix SSR)
@@ -697,6 +1008,8 @@ export default function QuantitativoApp() {
       if(c) setClientes(JSON.parse(c));
       if(o) setObras(JSON.parse(o));
     } catch(e){}
+    // Carrega meta do banco Arqmedes (sem carregar o banco completo ainda)
+    setArqMeta(getArqMeta());
     iniciado.current = true;
   },[]);
 
@@ -715,9 +1028,13 @@ export default function QuantitativoApp() {
           <div style={{fontSize:15,fontWeight:800,marginBottom:2}}>Quantitativos IA</div>
           <div style={{fontSize:11,color:"#6b7280"}}>Medição · Orçamento · SINAPI</div>
           {sinapiRef&&<div style={{fontSize:10,color:"#22c55e",marginTop:4}}>● SINAPI BA {sinapiRef}</div>}
+          {arqMeta?.totalItens>0
+            ? <div style={{fontSize:10,color:"#f59e0b",marginTop:2}}>★ Arqmedes {arqMeta.totalItens} itens</div>
+            : <div style={{fontSize:10,color:"#6b7280",marginTop:2}}>○ Arqmedes não carregado</div>
+          }
         </div>
         <div style={{padding:"12px 0"}}>
-          {[{id:"obras",label:"Obras",icon:"🏗️"},{id:"clientes",label:"Clientes",icon:"🏢"},{id:"sinapi",label:"SINAPI Bahia",icon:"📋"},{id:"orcamento",label:"Orçamento",icon:"💰"}].map(item=>(
+          {[{id:"obras",label:"Obras",icon:"🏗️"},{id:"clientes",label:"Clientes",icon:"🏢"},{id:"banco",label:"Banco Preços",icon:"💾"},{id:"sinapi",label:"SINAPI Bahia",icon:"📋"},{id:"orcamento",label:"Orçamento",icon:"💰"}].map(item=>(
             <button key={item.id} onClick={()=>setSecao(item.id)} style={{width:"100%",textAlign:"left",padding:"10px 20px",border:"none",cursor:"pointer",background:secao===item.id?"rgba(255,255,255,0.1)":"transparent",color:secao===item.id?"#fff":"#9ca3af",fontSize:13,fontWeight:secao===item.id?600:400,borderLeft:`3px solid ${secao===item.id?"#fff":"transparent"}`}}>{item.icon} {item.label}</button>
           ))}
         </div>
@@ -730,6 +1047,7 @@ export default function QuantitativoApp() {
       <div style={{flex:1,padding:"32px 36px",overflowX:"auto",minWidth:0}}>
         {secao==="clientes"  && <SecaoClientes clientes={clientes} setClientes={setClientes} obras={obras}/>}
         {secao==="obras"     && <SecaoObras obras={obras} setObras={setObras} clientes={clientes}/>}
+        {secao==="banco"     && <SecaoBancoPrecos arqMeta={arqMeta} onAtualizar={()=>setArqMeta(getArqMeta())}/>}
         {secao==="sinapi"    && <SecaoSinapi/>}
         {secao==="orcamento" && <SecaoOrcamento obras={obras}/>}
       </div>
@@ -1145,22 +1463,169 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
     return tiles;
   };
 
+  // Parse DXF no browser — aceita File (DXF local) ou string direta (DXF convertido pela APS)
+  const parseDxfClientSide = async (fileOrText, onProgress) => {
+    let dxfText;
+    if (typeof fileOrText === "string") {
+      // Texto já pronto — veio da conversão APS (UTF-8)
+      dxfText = fileOrText;
+    } else {
+      onProgress?.("Lendo arquivo DXF...");
+      const buffer = await fileOrText.arrayBuffer();
+      // Tenta UTF-8 primeiro; se houver caracteres inválidos (U+FFFD) usa Windows-1252
+      const utf8 = new TextDecoder("utf-8").decode(buffer);
+      dxfText = utf8.includes("�")
+        ? new TextDecoder("windows-1252").decode(buffer)
+        : utf8;
+    }
+
+    onProgress?.("Carregando parser DXF...");
+    const { Helper } = await import("dxf");
+
+    onProgress?.("Extraindo geometria CAD...");
+    const helper = new Helper(dxfText);
+    const parsed = helper.parsed;
+
+    // ── Utilidades (espelho do route.js) ────────────────────────────────────────
+    const dist = (a,b) => Math.sqrt((b.x-a.x)**2+(b.y-a.y)**2);
+    const polyLen = (verts) => { if(!verts||verts.length<2) return 0; let l=0; for(let i=1;i<verts.length;i++) l+=dist(verts[i-1],verts[i]); return l; };
+    const polyArea = (verts) => { if(!verts||verts.length<3) return 0; let a=0,n=verts.length; for(let i=0;i<n;i++){const j=(i+1)%n;a+=verts[i].x*verts[j].y-verts[j].x*verts[i].y;} return Math.abs(a)/2; };
+    const lineLen = (e) => (!e.start||!e.end)?0:dist(e.start,e.end);
+
+    const insUnits = parsed?.header?.insUnits ?? 4;
+    const fator = ({1:25.4,2:304.8,4:1,5:10,6:1000})[insUnits] ?? 1;
+    const toM  = u => (u*fator)/1000;
+    const toM2 = u => (u*fator**2)/1e6;
+
+    const normBloco = nome => nome.replace(/-(AA|BB)_$/i,"").replace(/-N.{1,3}vel\s+\d+\s*-\s*Layout$/i,"").replace(/-\d{5,}$/,"").replace(/-V\d+$/,"").trim();
+    const extrairId = nome => { const m=nome.match(/-(\d{5,}|V\d+)(?:-(AA|BB)_|-N.+)?$/i); return m?m[1]:nome; };
+
+    const IGNORE_LAYER = [
+      /defpoints/i,/eixo/i,/refer/i,/auxiliar/i,/cota/i,/hachur/i,/borda/i,/moldura/i,/leader/i,/norte/i,/seta/i,/legenda/i,
+      /-anno/i,/-patt$/i,/-iden$/i,/-levl$/i,/-ttlb/i,/-schd$/i,/-nplt$/i,/-symb$/i,/^g-/i,/^s-grid/i,/viewport/i,/^vport/i,/^0$/,/^hold$/i,
+    ];
+    const IGNORE_BLOCO = [/^eixo\s*-/i,/swk-id/i,/swk-simb/i,/swk-/i,/filled arrow/i,/inclina/i,/^folha\s+-\s+a\d/i];
+
+    const layers = {}, blocos = {}, textos = [], dimensions = [];
+
+    const getL = nome => { const n=nome||"0"; if(!layers[n]) layers[n]={comprimento:0,area:0,contagem:0,tipos:new Set(),blocos:{},textos:[]}; return layers[n]; };
+
+    for(const e of parsed?.entities||[]) {
+      const lname = e.layer||"0";
+      if(IGNORE_LAYER.some(p=>p.test(lname))) continue;
+      if(e.type==="HATCH") continue;
+      const L = getL(lname);
+      L.contagem++;
+      L.tipos.add(e.type);
+
+      if(e.type==="LINE") {
+        const l=toM(lineLen(e)); if(l>0&&l<2000) L.comprimento+=l;
+      } else if(e.type==="LWPOLYLINE"||e.type==="POLYLINE") {
+        const v=e.vertices??e.points??[];
+        const l=toM(polyLen(v)); if(l>0&&l<20000) L.comprimento+=l;
+        if(e.closed){const a=toM2(polyArea(v)); if(a>0&&a<1e6) L.area+=a;}
+      } else if(e.type==="ARC"||e.type==="CIRCLE") {
+        const r=toM(e.radius??0);
+        if(r>0){
+          const frac=e.type==="ARC"?Math.abs((e.endAngle??360)-(e.startAngle??0))/360:1;
+          L.comprimento+=2*Math.PI*r*frac;
+          if(e.type==="CIRCLE") L.area+=Math.PI*r*r;
+        }
+      } else if(e.type==="INSERT") {
+        const raw=e.name||e.block||"?";
+        if(IGNORE_BLOCO.some(p=>p.test(raw))){L.contagem--;continue;}
+        const norm=normBloco(raw), id=extrairId(raw);
+        L.contagem--;
+        if(!L.blocos[norm]) L.blocos[norm]=new Set();
+        L.blocos[norm].add(id);
+        if(!blocos[norm]) blocos[norm]=new Set();
+        blocos[norm].add(id);
+      } else if(e.type==="TEXT"||e.type==="MTEXT") {
+        const txt=(e.text||e.string||"").trim();
+        if(txt.length>=2&&txt.length<=200){L.textos.push(txt);textos.push({texto:txt,layer:lname});}
+      } else if(e.type==="DIMENSION") {
+        const val=e.actualMeasurement??e.measurement;
+        if(val&&val>0) dimensions.push({valor_m:toM(val),layer:lname,texto:e.text||""});
+      }
+    }
+
+    // Serializa
+    const layersJson={};
+    for(const [nome,L] of Object.entries(layers)){
+      const bl={}; for(const [k,s] of Object.entries(L.blocos)) bl[k]=s.size;
+      const totalBl=Object.values(bl).reduce((s,v)=>s+v,0);
+      if(L.contagem<=0&&L.comprimento<0.01&&L.area<0.01&&totalBl===0) continue;
+      layersJson[nome]={contagem:Math.round(L.contagem),comprimento:Math.round(L.comprimento*100)/100,area:Math.round(L.area*100)/100,tipos:[...L.tipos],blocos:bl,textos:L.textos.slice(0,20)};
+    }
+    const blocosRel=Object.entries(blocos).map(([k,s])=>[k,{contagem:s.size,layers:{}}]).filter(([,v])=>v.contagem>0).sort((a,b)=>b[1].contagem-a[1].contagem).slice(0,80).reduce((acc,[k,v])=>{acc[k]=v;return acc;},{});
+    const totalComp=Object.values(layersJson).reduce((s,l)=>s+l.comprimento,0);
+    const totalArea=Object.values(layersJson).reduce((s,l)=>s+l.area,0);
+    const totalBl=Object.values(blocosRel).reduce((s,b)=>s+b.contagem,0);
+    const unidadeNome=fator===1?"mm":fator===10?"cm":fator===1000?"m":"outro";
+    const escalaMatch=textos.find(t=>/escala\s*[1:]/i.test(t.texto)||/^1:\d+$/.test(t.texto.trim()));
+
+    return {
+      layers:layersJson, blocos:blocosRel,
+      textos:textos.slice(0,80), dimensoes:dimensions.slice(0,100),
+      resumo:{total_layers:Object.keys(layersJson).length,total_comprimento_m:Math.round(totalComp*10)/10,total_area_m2:Math.round(totalArea*10)/10,total_blocos:totalBl,escala:escalaMatch?.texto||null,unidade_detectada:unidadeNome},
+    };
+  };
+
   // Carregar arquivos (sem analisar ainda)
   const carregarArquivos = async(files)=>{
     setErro("");
     for(const file of Array.from(files)){
+      // Skip documents that are clearly not engineering drawings
+      if (eNaoPlanta(file.name)) {
+        console.info(`[carregarArquivos] ignorado (não é planta): ${file.name}`);
+        continue;
+      }
       const disc=detectarDisciplina(file.name);
       const id=uid();
       const isDXF = file.name.toLowerCase().endsWith(".dxf");
+      const isDWG = file.name.toLowerCase().endsWith(".dwg");
       setPendentes(p=>[...p,{id,fileName:file.name,disciplina:disc,imgs:null,dxfData:null,status:"carregando",progresso:"Lendo arquivo..."}]);
       try{
-        if(isDXF){
-          // DXF: extrai dados geométricos exatos no servidor
-          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Extraindo geometria do DXF..."}:x));
-          const form=new FormData(); form.append("file",file,file.name);
-          const resp=await fetch("/api/parse-dxf",{method:"POST",body:form});
-          const dxfData=await resp.json();
-          if(dxfData.error) throw new Error(dxfData.error);
+        if(isDWG){
+          // DWG: converte para DXF via Autodesk Platform Services
+          // O arquivo vai direto para o S3 da Autodesk — não passa pelo Vercel
+          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Obtendo URL de upload (Autodesk)..."}:x));
+          const presignRes = await fetch(`/api/aps/presign?fileName=${encodeURIComponent(file.name)}`);
+          const presign = await presignRes.json();
+          if(presign.error) throw new Error("APS: " + presign.error);
+
+          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:`Enviando para Autodesk… (${(file.size/1024/1024).toFixed(1)} MB)`}:x));
+          const uploadRes = await fetch(presign.uploadUrl, {
+            method: "PUT",
+            body: file,
+            headers: { "Content-Type": "application/octet-stream" },
+          });
+          if(!uploadRes.ok) throw new Error(`Upload Autodesk falhou: ${uploadRes.status}`);
+
+          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Convertendo DWG → DXF (Autodesk)…"}:x));
+          const convertRes = await fetch("/api/aps/convert", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bucketKey: presign.bucketKey, objectKey: presign.objectKey, uploadKey: presign.uploadKey }),
+          });
+          if(!convertRes.ok){
+            const err = await convertRes.json().catch(()=>({}));
+            throw new Error("Conversão APS: " + (err.error || convertRes.status));
+          }
+          const dxfText = await convertRes.text();
+
+          setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:"Extraindo geometria do DXF convertido..."}:x));
+          const dxfData = await parseDxfClientSide(dxfText, msg =>
+            setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
+          );
+          const nL=dxfData.resumo?.total_layers||0;
+          const nB=dxfData.resumo?.total_blocos||0;
+          setPendentes(p=>p.map(x=>x.id===id?{...x,dxfData,status:"pronto",progresso:`DWG→DXF ✓ · ${nL} layers · ${nB} blocos · ${disc||"disciplina a detectar"}`}:x));
+        } else if(isDXF){
+          // DXF: parse no browser — não envia arquivo para o servidor (evita limite 4.5 MB Vercel)
+          const dxfData = await parseDxfClientSide(file, msg =>
+            setPendentes(p=>p.map(x=>x.id===id?{...x,progresso:msg}:x))
+          );
           const nL=dxfData.resumo?.total_layers||0;
           const nB=dxfData.resumo?.total_blocos||0;
           setPendentes(p=>p.map(x=>x.id===id?{...x,dxfData,status:"pronto",progresso:`DXF ✓ · ${nL} layers · ${nB} blocos · ${disc||"disciplina a detectar"}`}:x));
@@ -1210,20 +1675,38 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
       const pend=prontas[pi];
       // Delay de 4s entre plantas (exceto a primeira) para respeitar rate limit do Gemini free
       if(pi>0) await new Promise(r=>setTimeout(r,4000));
+      // Skip entire discipline if out of scope (e.g. EstruturaMet is always another company)
+      const DISC_SEMPRE_EXCLUIDAS = new Set(["EstruturaMet", "Especificação"]);
+      if (DISC_SEMPRE_EXCLUIDAS.has(pend.disciplina)) {
+        setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"ignorado",
+          progresso:`⚠️ ${pend.disciplina} — fora do escopo (executada por terceiros)`}:x));
+        continue;
+      }
       setPendentes(p=>p.map(x=>x.id===pend.id?{...x,status:"analisando",progresso:"IA analisando..."}:x));
       try{
         const obraAtualSnap = obras.find(o => o.id === obra.id);
         const plantasExist  = (obraAtualSnap?.plantas || []).filter(p => p.itens?.length > 0);
         const obraCtx       = montarObraCtx(obra, plantasExist);
 
-        // ── Branch DXF: envia dados estruturados como texto, não como imagem ──
+        // ── Branch DXF: 2 fases — geometria determinística + IA só faz SINAPI ──
         if(pend.dxfData){
-          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"IA quantificando DXF..."}:x));
-          const dxfPrompt = getDxfPrompt(pend.disciplina, obraCtx, pend.dxfData);
-          const dxfUserText = `Arquivo DXF: "${pend.fileName}" · Disciplina: ${pend.disciplina||"a identificar"}\n`
-            + `Resumo: ${pend.dxfData.resumo.total_layers} layers · ${pend.dxfData.resumo.total_comprimento_m}m comprimento total · `
-            + `${pend.dxfData.resumo.total_area_m2}m² área total · ${pend.dxfData.resumo.total_blocos} blocos.\n`
-            + "Quantifique todos os elementos baseado nos dados geométricos exatos fornecidos no sistema.";
+          // Fase 1 (instantânea): interpreta layers → elementos com quantidades exatas
+          setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"Calculando quantidades do CAD..."}:x));
+          const elementos = interpretarLayersDXF(pend.dxfData, obra);
+          if(elementos.length === 0){
+            // Fallback: manda dados brutos para IA interpretar (layers não reconhecidos)
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:"IA interpretando layers desconhecidos..."}:x));
+          } else {
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`${elementos.length} elementos calculados → buscando SINAPI...`}:x));
+          }
+
+          // Fase 2 (IA leve): prompt compacto — IA só resolve código SINAPI + preço
+          const dxfPrompt = elementos.length > 0
+            ? getDxfSinapiPrompt(elementos, pend.disciplina, obraCtx)
+            : getDxfPrompt(pend.disciplina, obraCtx, pend.dxfData); // fallback
+          const dxfUserText = elementos.length > 0
+            ? `DXF: "${pend.fileName}" · ${elementos.length} elementos pré-calculados.\nAtribua código SINAPI BA a cada item.`
+            : `Arquivo DXF: "${pend.fileName}" · Disciplina: ${pend.disciplina||"a identificar"}\nResumo: ${pend.dxfData.resumo.total_layers} layers · ${pend.dxfData.resumo.total_comprimento_m}m · ${pend.dxfData.resumo.total_blocos} blocos.\nQuantifique todos os elementos.`;
           const agora=Date.now();
           const espThrottle=3500-(agora-ultimaRequisicao.current);
           if(espThrottle>0) await new Promise(r=>setTimeout(r,espThrottle));
@@ -1235,6 +1718,11 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             const espera=(dataDxf.error.retryAfter||30)*1000;
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s...`}:x));
             await new Promise(r=>setTimeout(r,espera));
+            dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
+          }
+          for(let rt=0;rt<3&&dataDxf.error?.type==="gemini_error";rt++){
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Erro Gemini, aguardando 10s (tentativa ${rt+2}/4)...`}:x));
+            await new Promise(r=>setTimeout(r,10000));
             dataDxf=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:reqBodyDxf}).then(r=>r.json());
           }
           if(dataDxf.error) throw new Error(`Gemini: ${dataDxf.error.message||dataDxf.error.type}`);
@@ -1322,6 +1810,12 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
             const espera=(data.error.retryAfter||30)*1000;
             setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Aguardando ${Math.round(espera/1000)}s (tentativa ${rt+1}/8)...`}:x));
             await new Promise(r=>setTimeout(r,espera));
+            data=await chamar();
+          }
+          // Transient Gemini error (500) — retry up to 3x with 10s delay
+          for(let rt=0;rt<3&&data.error?.type==="gemini_error";rt++){
+            setPendentes(p=>p.map(x=>x.id===pend.id?{...x,progresso:`⏳ Erro Gemini, aguardando 10s (tentativa ${rt+2}/4)...`}:x));
+            await new Promise(r=>setTimeout(r,10000));
             data=await chamar();
           }
           if(data.error){
@@ -1541,12 +2035,15 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           <button onClick={e=>{e.stopPropagation();fileRef.current?.click();}} style={{...S.btn,fontSize:12,padding:"7px 16px"}}>📄 Selecionar arquivos</button>
           <button onClick={e=>{e.stopPropagation();folderRef.current?.click();}} style={{...S.btn,fontSize:12,padding:"7px 16px"}}>📂 Selecionar pasta</button>
         </div>
-        <input ref={fileRef} type="file" multiple accept=".pdf,.dxf,image/*" style={{display:"none"}} onChange={e=>carregarArquivos(e.target.files)}/>
-        <input ref={folderRef} type="file" multiple accept=".pdf,.dxf,image/*" style={{display:"none"}}
+        <input ref={fileRef} type="file" multiple accept=".pdf,.dxf,.dwg,image/*" style={{display:"none"}} onChange={e=>carregarArquivos(e.target.files)}/>
+        <input ref={folderRef} type="file" multiple accept=".pdf,.dxf,.dwg,image/*" style={{display:"none"}}
           {...{webkitdirectory:"",directory:""}}
           onChange={e=>{
-            const pdfs = Array.from(e.target.files).filter(f=>f.type==="application/pdf"||f.type.startsWith("image/"));
-            carregarArquivos(pdfs);
+            const suportados = Array.from(e.target.files).filter(f=>{
+              const n = f.name.toLowerCase();
+              return f.type==="application/pdf"||f.type.startsWith("image/")||n.endsWith(".dxf")||n.endsWith(".dwg");
+            });
+            carregarArquivos(suportados);
             e.target.value="";
           }}/>
       </div>
@@ -1570,12 +2067,12 @@ function DetalhesObra({obra,obras,setObras,clientes,onBack,onOpenPlanta}) {
           </div>
           {pendentes.map(p=>{
             const col=DISC_COR[p.disciplina]||{};
-            const statusCor = p.status==="concluido"?"#059669":p.status==="erro"?"#dc2626":p.status==="analisando"?"#2563eb":"#374151";
-            const statusBg  = p.status==="concluido"?"#f0fdf4":p.status==="erro"?"#fef2f2":p.status==="analisando"?"#eff6ff":"#fafafa";
+            const statusCor = p.status==="concluido"?"#059669":p.status==="erro"?"#dc2626":p.status==="analisando"?"#2563eb":p.status==="ignorado"?"#9ca3af":"#374151";
+            const statusBg  = p.status==="concluido"?"#f0fdf4":p.status==="erro"?"#fef2f2":p.status==="analisando"?"#eff6ff":p.status==="ignorado"?"#f9fafb":"#fafafa";
             return (
               <div key={p.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 16px",borderBottom:"1px solid #f3f4f6",background:statusBg,transition:"background .3s"}}>
                 <div style={{fontSize:20,flexShrink:0}}>
-                  {p.status==="carregando"?"⏳":p.status==="analisando"?<span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⚙️</span>:p.status==="concluido"?"✅":p.status==="erro"?"❌":"📄"}
+                  {p.status==="carregando"?"⏳":p.status==="analisando"?<span style={{display:"inline-block",animation:"spin 1s linear infinite"}}>⚙️</span>:p.status==="concluido"?"✅":p.status==="erro"?"❌":p.status==="ignorado"?"⏭️":"📄"}
                 </div>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{fontSize:13,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.fileName}</div>
@@ -2284,4 +2781,213 @@ function SecaoGabarito({obras,gabaritos,setGabaritos}) {
       )}
     </div>
   );
+}
+
+// ─── BANCO DE PREÇOS (ARQMEDES / CYPE) ───────────────────────────────────────
+function SecaoBancoPrecos({ arqMeta, onAtualizar }) {
+  const [carregando, setCarregando] = useState(false);
+  const [erro,       setErro]       = useState("");
+  const [msg,        setMsg]        = useState("");
+  const [preview,    setPreview]    = useState([]);
+  const [busca,      setBusca]      = useState("");
+  const [resultados, setResultados] = useState([]);
+  const [dragOver,   setDragOver]   = useState(false);
+  const [totalLocal, setTotalLocal] = useState(() => getArqItens().length);
+  const fileRef = useRef();
+
+  const pesquisar = (q) => {
+    setBusca(q);
+    if (!q.trim()) { setResultados([]); return; }
+    const itens = getArqItens();
+    const normS = s => String(s||"").normalize("NFD").replace(/[̀-ͯ]/g,"").toLowerCase();
+    const nq = normS(q);
+    setResultados(itens.filter(i => normS(i.descricao).includes(nq) || normS(i.codigo).includes(nq)).slice(0, 30));
+  };
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!["csv","txt","bc3"].includes(ext)) {
+      setErro("Formato não suportado. Use CSV, TXT ou BC3 (FIEBDC-3) exportado do Arqmedes/CYPE."); return;
+    }
+    setCarregando(true); setErro(""); setMsg("");
+    try {
+      const text = await file.text();
+      // Parse client-side (não depende do servidor para persistência)
+      const itens = parseCsvClient(text, ext);
+      if (!itens.length) throw new Error("Nenhum item reconhecido. Verifique se o arquivo tem colunas Código, Descrição, Unidade, Preço.");
+      setArqBanco(itens, { nomeArquivo: file.name, totalItens: itens.length });
+      setTotalLocal(itens.length);
+      setPreview(itens.slice(0, 10));
+      setMsg(`✅ ${itens.length.toLocaleString("pt-BR")} itens carregados de "${file.name}"`);
+      onAtualizar?.();
+      // Também envia ao servidor (cache em memória para busca semântica de fallback)
+      const form = new FormData(); form.append("file", file);
+      fetch("/api/banco-precos", { method: "POST", body: form }).catch(()=>{});
+    } catch(e) { setErro(`Erro: ${e.message}`); }
+    setCarregando(false);
+  };
+
+  const limpar = () => {
+    limparArqBanco();
+    setTotalLocal(0); setPreview([]); setResultados([]); setBusca("");
+    setMsg("Banco removido."); onAtualizar?.();
+    fetch("/api/banco-precos", { method: "DELETE" }).catch(()=>{});
+  };
+
+  const bancoAtivo = totalLocal > 0;
+
+  return (
+    <div>
+      <h1 style={{fontSize:22,fontWeight:700,marginBottom:4}}>Banco de Preços</h1>
+      <p style={{fontSize:13,color:"#6b7280",marginBottom:20}}>
+        Carregue o banco de preços do Arqmedes (CYPE) para usar como referência primária.
+        O SINAPI BA continua como fallback quando o item não for encontrado.
+      </p>
+
+      <div style={{...S.card,padding:16,marginBottom:20,background:"#fffbeb",border:"1px solid #fcd34d"}}>
+        <div style={{fontSize:12,fontWeight:600,color:"#92400e",marginBottom:8}}>📤 Como exportar do Arqmedes (CYPE):</div>
+        <div style={{fontSize:12,color:"#78350f",lineHeight:1.9}}>
+          <strong>Opção 1 — CSV:</strong> Mostrar → Lista de Composições → Lista → Preços Unitários → Exportar CSV<br/>
+          <strong>Opção 2 — Insumos:</strong> Arquivo → Exportar → Lista de Insumos → CSV<br/>
+          <strong>Opção 3 — FIEBDC-3:</strong> Arquivo → Exportar → Banco FIEBDC-3 (.bc3) — formato universal<br/>
+          <span style={{fontSize:11,color:"#92400e"}}>Colunas esperadas: Código | Descrição | Unidade | Preço Unitário</span>
+        </div>
+      </div>
+
+      <div style={{...S.card,padding:16,marginBottom:20,display:"flex",alignItems:"center",gap:16}}>
+        <div style={{flex:1}}>
+          {bancoAtivo ? (
+            <>
+              <div style={{fontSize:14,fontWeight:600,color:"#059669"}}>✅ Banco ativo — {totalLocal.toLocaleString("pt-BR")} itens</div>
+              {arqMeta?.nomeArquivo && <div style={{fontSize:12,color:"#6b7280",marginTop:2}}>Arquivo: {arqMeta.nomeArquivo}</div>}
+              {arqMeta?.salvoEm    && <div style={{fontSize:11,color:"#9ca3af"}}>Carregado em: {new Date(arqMeta.salvoEm).toLocaleString("pt-BR")}</div>}
+              <div style={{fontSize:12,color:"#6b7280",marginTop:4}}>Preços deste banco têm prioridade sobre o SINAPI em todos os orçamentos.</div>
+            </>
+          ) : (
+            <>
+              <div style={{fontSize:14,fontWeight:600,color:"#9ca3af"}}>○ Banco não carregado</div>
+              <div style={{fontSize:12,color:"#9ca3af",marginTop:2}}>Usando SINAPI BA Não Desonerado como referência de preços.</div>
+            </>
+          )}
+        </div>
+        {bancoAtivo && (
+          <button onClick={limpar} style={{...S.btn,color:"#dc2626",borderColor:"#fecaca",fontSize:12,whiteSpace:"nowrap"}}>
+            🗑️ Remover banco
+          </button>
+        )}
+      </div>
+
+      <div
+        onDragOver={e=>{e.preventDefault();setDragOver(true);}}
+        onDragLeave={()=>setDragOver(false)}
+        onDrop={e=>{e.preventDefault();setDragOver(false);handleFile(e.dataTransfer.files[0]);}}
+        onClick={()=>fileRef.current?.click()}
+        style={{border:`2px dashed ${dragOver?"#6366f1":"#d1d5db"}`,borderRadius:12,padding:"32px 20px",textAlign:"center",cursor:"pointer",background:dragOver?"#f0f1ff":"#f9fafb",marginBottom:16,transition:"all .2s"}}>
+        <input ref={fileRef} type="file" accept=".csv,.txt,.bc3" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+        <div style={{fontSize:28,marginBottom:8}}>📁</div>
+        {carregando
+          ? <div style={{fontSize:13,color:"#6366f1"}}>Processando arquivo…</div>
+          : <><div style={{fontSize:13,fontWeight:500,color:"#374151"}}>Arraste o arquivo aqui ou clique para selecionar</div>
+             <div style={{fontSize:11,color:"#9ca3af",marginTop:4}}>CSV, TXT, BC3 (FIEBDC-3) — exportado do Arqmedes/CYPE</div></>
+        }
+      </div>
+
+      {erro && <div style={{background:"#fee2e2",border:"1px solid #fecaca",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#dc2626",marginBottom:12}}>{erro}</div>}
+      {msg  && <div style={{background:"#dcfce7",border:"1px solid #86efac",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#166534",marginBottom:12}}>{msg}</div>}
+
+      {bancoAtivo && (
+        <div style={{...S.card,padding:16,marginBottom:20}}>
+          <div style={{fontSize:13,fontWeight:600,marginBottom:10}}>🔍 Testar banco de preços</div>
+          <input style={S.input} value={busca} onChange={e=>pesquisar(e.target.value)} placeholder="Buscar por descrição ou código…"/>
+          {resultados.length > 0 && (
+            <div style={{marginTop:10,overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr>{["Código","Descrição","Un","Preço"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {resultados.map((it,j)=>(
+                    <tr key={j} style={{background:j%2===0?"#fff":"#fafafa"}}>
+                      <td style={{...S.td,fontFamily:"monospace",fontSize:10,whiteSpace:"nowrap"}}>{it.codigo}</td>
+                      <td style={{...S.td,minWidth:200}}>{it.descricao}</td>
+                      <td style={{...S.td,textAlign:"center",color:"#6b7280"}}>{it.un||"—"}</td>
+                      <td style={{...S.td,textAlign:"right",fontWeight:600,color:"#059669"}}>{it.preco?.toLocaleString("pt-BR",{style:"currency",currency:"BRL"})||"—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {resultados.length===30 && <div style={{fontSize:11,color:"#9ca3af",marginTop:6,textAlign:"right"}}>30 primeiros resultados — refine a busca para mais.</div>}
+            </div>
+          )}
+          {busca && resultados.length===0 && <div style={{fontSize:12,color:"#9ca3af",marginTop:8}}>Nenhum item encontrado para "{busca}".</div>}
+        </div>
+      )}
+
+      {preview.length > 0 && (
+        <div style={{...S.card,overflow:"hidden"}}>
+          <div style={{padding:"10px 16px",borderBottom:"1px solid #e5e7eb",fontSize:13,fontWeight:600}}>Preview — primeiros {preview.length} itens</div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead><tr>{["Código","Descrição","Un","Preço"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+              <tbody>
+                {preview.map((it,j)=>(
+                  <tr key={j} style={{background:j%2===0?"#fff":"#fafafa"}}>
+                    <td style={{...S.td,fontFamily:"monospace",fontSize:10,whiteSpace:"nowrap"}}>{it.codigo}</td>
+                    <td style={{...S.td,minWidth:200}}>{it.descricao}</td>
+                    <td style={{...S.td,textAlign:"center",color:"#6b7280"}}>{it.un||"—"}</td>
+                    <td style={{...S.td,textAlign:"right",fontWeight:600,color:"#059669"}}>{it.preco?.toLocaleString("pt-BR",{style:"currency",currency:"BRL"})||"—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Parser CSV minimalista client-side (salva em localStorage sem depender do servidor)
+function parseCsvClient(text, ext) {
+  if (!text?.trim()) return [];
+  if (ext === "bc3") return parseBc3Client(text);
+  const linhas = text.split(/\r?\n/).filter(l => l.trim());
+  if (linhas.length < 2) return [];
+  const amostra = linhas.slice(0,4).join("\n");
+  const sep = [";","\t",","].sort((a,b)=>(amostra.match(new RegExp(`\\${b}`,"g"))||[]).length-(amostra.match(new RegExp(`\\${a}`,"g"))||[]).length)[0];
+  const split = l => l.split(sep).map(s=>s.trim().replace(/^"|"$/g,""));
+  const header = split(linhas[0]).map(h=>h.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"").replace(/\s+/g," ").trim());
+  const idx = als => { for(const a of als){const i=header.findIndex(h=>h.includes(a)||a.includes(h));if(i>=0)return i;} return -1; };
+  const iCod  = idx(["código","codigo","cod","ref","item","code"]);
+  const iDesc = idx(["descrição","descricao","nome","servico","composição","description","titulo"]);
+  const iUn   = idx(["un.","un","unid","unidade","unit","und"]);
+  const iPreco= idx(["preço","preco","preço unitário","preco unitario","custo","valor","price"]);
+  if (iDesc < 0 || iPreco < 0) return [];
+  const toNum = v => { const s=String(v||"").replace(/\s/g,"").replace(/\./g,"").replace(",","."); const n=parseFloat(s); return isNaN(n)||n<=0?null:n; };
+  const result = [];
+  for (let i = 1; i < linhas.length; i++) {
+    const p = split(linhas[i]);
+    const preco = toNum(p[iPreco]); const desc = p[iDesc]?.trim();
+    if (!desc || !preco) continue;
+    result.push({ codigo: iCod>=0?p[iCod]?.trim()||`ARQ-${i}`:`ARQ-${i}`, descricao:desc, un:iUn>=0?p[iUn]?.trim().toLowerCase():"", preco, fonte:"arqmedes" });
+  }
+  return result;
+}
+
+function parseBc3Client(text) {
+  const result = [];
+  for (const linha of text.split(/\r?\n/)) {
+    if (!linha.startsWith("~C") && !linha.startsWith("~D")) continue;
+    const tipo = linha.slice(0,2); const partes = linha.slice(3).split("|");
+    const cod = partes[0]?.trim(); if (!cod) continue;
+    let desc="", un="", preco=null;
+    if (tipo==="~C") {
+      un=partes[1]?.trim(); desc=partes[2]?.trim()||partes[3]?.trim();
+      for(let k=3;k<partes.length;k++){const p=parseFloat(String(partes[k]||"").replace(",","."));if(!isNaN(p)&&p>0){preco=p;break;}}
+    } else {
+      un=partes[1]?.trim(); const p=parseFloat(String(partes[3]||"").replace(",","."));if(!isNaN(p)&&p>0)preco=p;
+      for(let k=partes.length-1;k>=4;k--){if(partes[k]?.trim()){desc=partes[k].trim();break;}}
+    }
+    if (desc&&preco) result.push({codigo:cod,descricao:desc,un:un?.toLowerCase()||"",preco,fonte:"arqmedes"});
+  }
+  return result;
 }
