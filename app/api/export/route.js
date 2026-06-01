@@ -120,6 +120,12 @@ function style(row, { bg, bold = false, fs = 9.5, fc = C.texto, h = 16 } = {}) {
 // ════════════════════════════════════════════════════════════════════════════════
 // MODO QUANTITATIVO — formato limpo sem MO, foco em precisão de levantamento
 // ════════════════════════════════════════════════════════════════════════════════
+// Normaliza nome de disciplina: garante capitalização consistente (Hidrossanitária ≠ hidrossanitária → mesma aba)
+function normDisc(d) {
+  if (!d) return "Sem disciplina";
+  return d.charAt(0).toUpperCase() + d.slice(1);
+}
+
 async function gerarQuantitativo(obra, incluirPreco) {
   const wb = new ExcelJS.Workbook();
   wb.creator = "Quantitativos IA — Sepeng Engenharia";
@@ -128,7 +134,7 @@ async function gerarQuantitativo(obra, incluirPreco) {
   const plantas = obra.plantas || [];
   const grupos  = {};
   for (const p of plantas) {
-    const d = p.disciplina || "Sem disciplina";
+    const d = normDisc(p.disciplina);
     if (!grupos[d]) grupos[d] = [];
     grupos[d].push(p);
   }
@@ -351,11 +357,16 @@ async function gerarQuantitativo(obra, incluirPreco) {
 
 // ── Handler principal ──────────────────────────────────────────────────────────
 export async function POST(request) {
-  const { obra, bdi = 25, modo = "quantitativo", incluirPreco = false } = await request.json();
+  let body;
+  try { body = await request.json(); }
+  catch { return Response.json({ error: "Payload inválido" }, { status: 400 }); }
+
+  const { obra, bdi = 25, modo = "quantitativo", incluirPreco = false } = body;
   if (!obra) return Response.json({ error: "Obra não informada" }, { status: 400 });
 
+  try {
   // Modo quantitativo (padrão) — formato limpo sem MO
-  if (modo === "quantitativo") return gerarQuantitativo(obra, incluirPreco);
+  if (modo === "quantitativo") return await gerarQuantitativo(obra, incluirPreco);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = "Quantitativos IA — Sepeng Engenharia";
@@ -414,7 +425,7 @@ export async function POST(request) {
   const plantas = obra.plantas || [];
   const grupos  = {};
   for (const p of plantas) {
-    const d = p.disciplina || "Sem disciplina";
+    const d = normDisc(p.disciplina);
     if (!grupos[d]) grupos[d] = [];
     grupos[d].push(p);
   }
@@ -701,4 +712,8 @@ export async function POST(request) {
       "Content-Disposition": `attachment; filename="${nome}"`,
     },
   });
+  } catch (err) {
+    console.error("[export] erro:", err);
+    return Response.json({ error: err.message || "Erro ao gerar Excel" }, { status: 500 });
+  }
 }
